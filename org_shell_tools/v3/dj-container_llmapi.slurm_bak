@@ -1,0 +1,88 @@
+#!/bin/bash
+#SBATCH --job-name=vllm-qwen-single-container
+#SBATCH --partition=5090-eth-2
+#SBATCH --nodelist=msxf-hpc-71-19-ai
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=120
+#SBATCH --time=7-00:00:00
+#SBATCH --output=log/dj-slurm-%j.log
+#SBATCH --error=log/dj-slurm-%j.err
+
+
+echo "=== 作业开始时间: $(date) ==="
+echo "分配的节点: $SLURM_JOB_NODELIST"
+
+MODEL_NAME="Qwen2.5-7B-Instruct"
+MODEL_PATH="/workspace/models/${MODEL_NAME}"
+SIF_FILE="/share/global/datajuicer/sif/vllm-xww.sif"
+PORT=8000
+
+mkdir -p log /share/global/datajuicer/logs
+mkdir -p /share/global/datajuicer/.cache/vllm/tmp
+
+echo "[$(date)] Starting vLLM with Data Parallel (8 GPUs)..."
+
+# 关键修复：使用 bash -c 在容器内动态检测 Python 路径
+srun --gres=gpu:8 --ntasks=1  \
+    singularity exec \
+    --cleanenv \
+    --nv \
+    --writable-tmpfs \
+    -B /share/global/datajuicer/.cache:/workspace/.cache \
+    -B /share/aidev/data:/workspace/data \
+    -B /share/global/datajuicer:/workspace/datajuicer \
+    -B /share/global/models:/workspace/models \
+    --env TMPDIR=/workspace/.cache/vllm/tmp \
+    --env VLLM_CACHE_ROOT=/workspace/.cache/vllm \
+    ${SIF_FILE} \
+    bash -c '
+        # 在容器内检测 Python 路径
+        PYTHON_CMD=$(command -v python3 || command -v python || echo "/usr/bin/python3")
+        echo "[$(date)] Using Python: $PYTHON_CMD"
+
+        # 检查 Python 是否可用
+        if ! $PYTHON_CMD --version > /dev/null 2>&1; then
+            echo "[$(date)] ❌ Python not found! Available executables:"
+            ls -la /usr/bin/python* 2>/dev/null || echo "No /usr/bin/python*"
+            ls -la /opt/conda/bin/python* 2>/dev/null || echo "No /opt/conda/bin/python*"
+            which python3 || echo "which python3 failed"
+            exit 1
+        fi
+
+        # 启动 vLLM
+        $PYTHON_CMD -m vllm.entrypoints.openai.api_server \
+            --model '${MODEL_PATH}' \
+            --served-model-name qwen-7b \
+            --data-parallel-size 8 \
+            --tensor-parallel-size 1 \
+            --dtype bfloat16 \
+            --port '${PORT}' \
+            --host 0.0.0.0 \
+            --gpu-memory-utilization 0.85 \
+            --enable-prefix-caching \
+            > /workspace/datajuicer/logs/vllm-dp.log 2>&1 &
+
+        PID=$!
+        echo "[$(date)] vLLM started with PID: $PID"
+
+        # 等待就绪
+        for i in $(seq 1 60); do
+            sleep 2
+            if grep -q "Application startup complete" /workspace/datajuicer/logs/vllm-dp.log 2>/dev/null; then
+                echo "[$(date)] ✅ vLLM Data Parallel service is ready!"
+                break
+            fi
+            if ! ps -p $PID > /dev/null 2>&1; then
+                echo "[$(date)] ❌ Process died"
+                exit 1
+            fi
+        done
+        wait
+    '
+
+echo "[$(date)] Job completed"
+
+
+

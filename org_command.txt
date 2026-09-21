@@ -1,0 +1,32 @@
+
+
+# 查看某个计算节点的使用情况
+squeue --nodelist=msxf-hpc-64-55-ai
+
+# 保活 cpu 计算集群脚本
+sbatch /data/hpc/home/zhiliang.jin/test_datajuicer/sourcecode/data-juicer/bash/v3/dj-container_keeplive.slurm
+
+# 保活 gpu 计算集群服务器的脚本
+sbatch --nodes=1 --nodelist msxf-hpc-31-18-ai \
+    --export=ALL,GPU_UTIL_TARGET=50 \
+    dj-container_gpu_keeplive.slurm
+    
+# 创建的查看某个partition 计算集群服务器情况的脚本
+bash /data/hpc/home/zhiliang.jin/slm_dataset_deal/slurm_node_ip.sh 5090-eth-2 --gpu  --idle --list
+
+
+# 查看slurm 某人的任务和使用机器情况
+zhiliang.jin@msxf-hpc-2-142-ai:~/test_datajuicer/sourcecode/data-juicer/bash$ squeue -u zhiliang.jin
+             JOBID PARTITION     NAME     USER ST       TIME  NODES NODELIST(REASON)
+            131974 5090-eth- vllm-qwe zhiliang  R    1:37:14      1 msxf-hpc-64-55-ai
+            130752 5090-eth- vllm-qwe zhiliang  R 2-18:09:12     37 msxf-hpc-8-21-ai,msxf-hpc-8-22-ai,msxf-hpc-8-23-ai,msxf-hpc-8-24-ai,msxf-hpc-8-27-ai,msxf-hpc-8-28-ai,msxf-hpc-8-30-ai,msxf-hpc-8-31-ai,msxf-hpc-8-32-ai,msxf-hpc-8-33-ai,msxf-hpc-8-34-ai,msxf-hpc-8-35-ai,msxf-hpc-17-9-ai,msxf-hpc-17-10-ai,msxf-hpc-31-18-ai,msxf-hpc-31-19-ai,msxf-hpc-31-20-ai,msxf-hpc-31-21-ai,msxf-hpc-31-23-ai,msxf-hpc-35-9-ai,msxf-hpc-36-13-ai,msxf-hpc-37-1-ai,msxf-hpc-37-14-ai,msxf-hpc-37-15-ai,msxf-hpc-37-16-ai,msxf-hpc-37-17-ai,msxf-hpc-37-18-ai,msxf-hpc-37-19-ai,msxf-hpc-37-20-ai,msxf-hpc-37-21-ai,msxf-hpc-37-24-ai,msxf-hpc-64-37-ai,msxf-hpc-64-47-ai,msxf-hpc-64-49-ai,msxf-hpc-64-50-ai,msxf-hpc-64-51-ai,msxf-hpc-64-52-ai
+            129286   ray-cpu data-jui zhiliang  R 6-00:59:10     10 msxf-app-33-5-ai,msxf-app-33-6-ai,msxf-app-33-7-ai,msxf-app-33-8-ai,msxf-app-33-9-ai,msxf-app-33-10-ai,msxf-app-33-11-ai,msxf-app-33-12-ai,msxf-app-33-13-ai,msxf-app-33-14-ai
+zhiliang.jin@msxf-hpc-2-142-ai:~/test_datajuicer/sourcecode/data-juicer/bash$ 
+
+
+# 之前用于构建 open-dataflow 服务构建的一个docker 镜像文件
+/data/hpc/home/zhiliang.jin/dataflow-offline-delivery/dataflow-webui-offline-1.0.2-manual.docker.tar
+
+
+
+    
