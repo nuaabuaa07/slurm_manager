@@ -86,6 +86,7 @@ class StateStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    submitted_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                     slurm_job_id TEXT NOT NULL UNIQUE,
                     job_type TEXT NOT NULL,
                     name TEXT NOT NULL,
@@ -95,9 +96,48 @@ class StateStore:
                     nodelist TEXT NOT NULL DEFAULT '',
                     script_path TEXT NOT NULL DEFAULT '',
                     payload TEXT NOT NULL DEFAULT '{}',
-                    source TEXT NOT NULL DEFAULT 'cluster'
+                    source TEXT NOT NULL DEFAULT 'cluster',
+                    submit_method TEXT NOT NULL DEFAULT 'Terminal',
+                    submit_command TEXT NOT NULL DEFAULT '',
+                    submit_cwd TEXT NOT NULL DEFAULT '',
+                    command_origin TEXT NOT NULL DEFAULT '',
+                    command_user_edited INTEGER NOT NULL DEFAULT 0,
+                    capture_status TEXT NOT NULL DEFAULT 'missing',
+                    captured_at TEXT NOT NULL DEFAULT '',
+                    script_snapshot TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS quick_job_command_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    quick_job_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    submit_command TEXT NOT NULL,
+                    submit_cwd TEXT NOT NULL DEFAULT '',
+                    command_origin TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(quick_job_id) REFERENCES quick_jobs(id) ON DELETE CASCADE
                 );
                 """
+            )
+            quick_job_columns = {
+                str(row["name"]) for row in db.execute("PRAGMA table_info(quick_jobs)").fetchall()
+            }
+            if "submitted_at" not in quick_job_columns:
+                db.execute("ALTER TABLE quick_jobs ADD COLUMN submitted_at TEXT")
+            quick_job_additions = {
+                "submit_method": "TEXT NOT NULL DEFAULT 'Terminal'",
+                "submit_command": "TEXT NOT NULL DEFAULT ''",
+                "submit_cwd": "TEXT NOT NULL DEFAULT ''",
+                "command_origin": "TEXT NOT NULL DEFAULT ''",
+                "command_user_edited": "INTEGER NOT NULL DEFAULT 0",
+                "capture_status": "TEXT NOT NULL DEFAULT 'missing'",
+                "captured_at": "TEXT NOT NULL DEFAULT ''",
+                "script_snapshot": "TEXT NOT NULL DEFAULT ''",
+            }
+            for column, declaration in quick_job_additions.items():
+                if column not in quick_job_columns:
+                    db.execute(f"ALTER TABLE quick_jobs ADD COLUMN {column} {declaration}")
+            db.execute(
+                """UPDATE quick_jobs SET submit_method='WebUI'
+                   WHERE source IN ('quick','webui') AND submit_method='Terminal'"""
             )
             db.execute(
                 """INSERT INTO compute_tasks(name,task_type,slurm_job_id,host,port,command,pid,status)
@@ -284,6 +324,18 @@ class StateStore:
             result.append(item)
         return result
 
+    def quick_job(self, record_id: int) -> Optional[Dict[str, Any]]:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM quick_jobs WHERE id=?", (record_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item["payload"] = json.loads(item["payload"])
+        except (TypeError, json.JSONDecodeError):
+            item["payload"] = {}
+        return item
+
     def save_quick_job(
         self,
         slurm_job_id: str,
@@ -297,30 +349,34 @@ class StateStore:
         payload: Dict[str, Any],
         source: str = "cluster",
         record_id: Optional[int] = None,
+        submitted_at: str = "",
     ) -> int:
         encoded = json.dumps(payload, ensure_ascii=False)
         with self._connect() as db:
             if record_id is not None:
                 db.execute(
                     """UPDATE quick_jobs SET slurm_job_id=?,job_type=?,name=?,state=?,partition=?,
-                       node_count=?,nodelist=?,script_path=?,payload=?,source=?,updated_at=CURRENT_TIMESTAMP
+                       node_count=?,nodelist=?,script_path=?,payload=?,source=?,
+                       submitted_at=COALESCE(?,datetime('now','localtime')),updated_at=CURRENT_TIMESTAMP
                        WHERE id=?""",
                     (slurm_job_id, job_type, name, state, partition, node_count, nodelist,
-                     script_path, encoded, source, record_id),
+                     script_path, encoded, source, submitted_at or None, record_id),
                 )
                 return record_id
             db.execute(
-                """INSERT INTO quick_jobs(
-                       slurm_job_id,job_type,name,state,partition,node_count,nodelist,script_path,payload,source
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """INSERT INTO quick_jobs(
+                       slurm_job_id,job_type,name,state,partition,node_count,nodelist,script_path,payload,source,submitted_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE(?,datetime('now','localtime')))
                    ON CONFLICT(slurm_job_id) DO UPDATE SET
                        job_type=excluded.job_type,name=excluded.name,state=excluded.state,
                        partition=excluded.partition,node_count=excluded.node_count,nodelist=excluded.nodelist,
                        script_path=CASE WHEN excluded.script_path='' THEN quick_jobs.script_path ELSE excluded.script_path END,
                        payload=CASE WHEN excluded.payload='{}' THEN quick_jobs.payload ELSE excluded.payload END,
+                       submitted_at=CASE WHEN quick_jobs.submitted_at IS NULL OR quick_jobs.submitted_at=''
+                                         THEN excluded.submitted_at ELSE quick_jobs.submitted_at END,
                        updated_at=CURRENT_TIMESTAMP""",
                 (slurm_job_id, job_type, name, state, partition, node_count, nodelist,
-                 script_path, encoded, source),
+                 script_path, encoded, source, submitted_at or None),
             )
             row = db.execute("SELECT id FROM quick_jobs WHERE slurm_job_id=?", (slurm_job_id,)).fetchone()
             return int(row["id"])
@@ -332,6 +388,49 @@ class StateStore:
                 (state, record_id),
             )
 
+    def save_quick_job_command(
+        self,
+        record_id: int,
+        command: str,
+        cwd: str,
+        origin: str,
+        user_edited: bool,
+        capture_status: str,
+        script_snapshot: str = "",
+        submit_method: str = "",
+    ) -> None:
+        with self._connect() as db:
+            current = db.execute(
+                "SELECT submit_command,submit_cwd,command_origin FROM quick_jobs WHERE id=?",
+                (record_id,),
+            ).fetchone()
+            if current and (current["submit_command"] or current["submit_cwd"]):
+                db.execute(
+                    """INSERT INTO quick_job_command_history(
+                           quick_job_id,submit_command,submit_cwd,command_origin
+                       ) VALUES(?,?,?,?)""",
+                    (record_id, current["submit_command"], current["submit_cwd"], current["command_origin"]),
+                )
+            db.execute(
+                """UPDATE quick_jobs SET submit_command=?,submit_cwd=?,command_origin=?,
+                   command_user_edited=?,capture_status=?,captured_at=datetime('now','localtime'),
+                   script_snapshot=CASE WHEN ?='' THEN script_snapshot ELSE ? END,
+                   submit_method=CASE WHEN ?='' THEN submit_method ELSE ? END,
+                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (command, cwd, origin, 1 if user_edited else 0, capture_status,
+                 script_snapshot, script_snapshot, submit_method, submit_method, record_id),
+            )
+
+    def quick_job_command_history(self, record_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM quick_job_command_history
+                   WHERE quick_job_id=? ORDER BY id DESC LIMIT ?""",
+                (record_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def delete_quick_job(self, record_id: int) -> None:
         with self._connect() as db:
+            db.execute("DELETE FROM quick_job_command_history WHERE quick_job_id=?", (record_id,))
             db.execute("DELETE FROM quick_jobs WHERE id=?", (record_id,))

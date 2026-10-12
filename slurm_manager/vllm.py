@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Mapping, Sequence
 
 from .files import resolve_allowed
 
@@ -137,6 +137,16 @@ def parse_ports(value: str) -> List[int]:
 def build_endpoints(addresses: Iterable[str], ports: Iterable[int], path: str = "/v1/chat/completions") -> List[str]:
     normalized = "/" + path.lstrip("/")
     return [f"http://{address}:{port}{normalized}" for address in addresses for port in ports]
+
+
+def select_healthy_endpoints(
+    endpoints: Sequence[str], checks: Sequence[Mapping[str, object]], drop_failed: bool = True
+) -> List[str]:
+    """Keep endpoint order while selecting only explicitly successful checks."""
+    if not drop_failed:
+        return list(endpoints)
+    status = {str(item.get("endpoint", "")): bool(item.get("ok")) for item in checks}
+    return [endpoint for endpoint in endpoints if status.get(endpoint, False)]
 
 
 def detect_models(endpoints: Sequence[str], token: str = "", timeout: int = 8) -> List[Dict[str, object]]:

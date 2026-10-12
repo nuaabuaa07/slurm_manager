@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -37,6 +38,7 @@ from slurm_manager.vllm import (
     infer_vllm_settings,
     parse_ports,
     preview_yaml_endpoint_update,
+    select_healthy_endpoints,
     update_python_endpoint_block,
     update_yaml_endpoint_block,
 )
@@ -152,17 +154,57 @@ def split_values(text: str) -> List[str]:
     return [item.strip() for item in text.replace("\n", ",").split(",") if item.strip()]
 
 
-def scroll_text(text: str, height: int = 420) -> None:
-    components.html(
+def scroll_text(text: str, key: str, height: int = 420) -> None:
+    """Render a persistent tail-style log viewer with follow and collapse controls."""
+    expanded_key = "log_viewer_expanded_" + key
+    if expanded_key not in st.session_state:
+        st.session_state[expanded_key] = True
+    expanded = bool(st.session_state[expanded_key])
+    toggle_label = "收起日志" if expanded else "展开日志"
+    if st.button(toggle_label, key="toggle_log_viewer_" + key):
+        st.session_state[expanded_key] = not expanded
+        st.rerun()
+    if not expanded:
+        st.caption("日志文本框已收起；自动刷新不会改变收起状态。")
+        return
+
+    storage_key = json.dumps("slurm-manager-log-" + key, ensure_ascii=False)
+    document = (
         "<!doctype html><html><head><style>"
-        "html,body{margin:0;padding:0;background:#f6f8fa;}"
-        "pre{box-sizing:border-box;margin:0;width:100%;height:100vh;overflow:auto;"
+        "html,body{margin:0;padding:0;background:#f6f8fa;color:#24292f;overflow:hidden;}"
+        ".toolbar{box-sizing:border-box;height:38px;display:flex;align-items:center;gap:8px;"
+        "padding:5px 8px;border:1px solid #dfe2e5;border-bottom:0;border-radius:6px 6px 0 0;"
+        "background:#eef1f4;font:12px sans-serif;}"
+        "button{border:1px solid #b8bec7;background:white;border-radius:5px;padding:4px 9px;cursor:pointer;}"
+        "button:hover{background:#f6f8fa}.status{margin-left:auto;color:#57606a;}"
+        "pre{box-sizing:border-box;margin:0;width:100%;height:calc(100vh - 38px);overflow:auto;"
         "white-space:pre-wrap;word-break:break-word;border:1px solid #dfe2e5;"
-        "border-radius:6px;padding:12px;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;}"
-        "</style></head><body><pre>" + html.escape(text) + "</pre></body></html>",
-        height=height,
-        scrolling=True,
+        "border-radius:0 0 6px 6px;padding:12px;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;}"
+        "</style></head><body>"
+        "<div class='toolbar'><button id='follow'></button><button id='bottom'>回到底部</button>"
+        "<span id='status' class='status'></span></div>"
+        "<pre id='log'>" + html.escape(text) + "</pre>"
+        "<script>"
+        "const base=" + storage_key + ";const log=document.getElementById('log');"
+        "const followButton=document.getElementById('follow');const status=document.getElementById('status');"
+        "let follow=true;let restoring=true;"
+        "try{const saved=sessionStorage.getItem(base+'-follow');if(saved!==null)follow=saved==='1';}catch(e){}"
+        "function save(name,value){try{sessionStorage.setItem(base+'-'+name,String(value));}catch(e){}}"
+        "function render(){followButton.textContent=follow?'暂停跟随':'继续跟随';"
+        "status.textContent=follow?'正在跟随日志尾部':'已暂停跟随';}"
+        "function toBottom(){restoring=true;log.scrollTop=log.scrollHeight;requestAnimationFrame(()=>{restoring=false;});}"
+        "requestAnimationFrame(()=>{if(follow){toBottom();}else{"
+        "let position=0;try{position=Number(sessionStorage.getItem(base+'-scroll')||0);}catch(e){}"
+        "log.scrollTop=position;restoring=false;}render();});"
+        "log.addEventListener('scroll',()=>{if(restoring)return;"
+        "const atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<16;"
+        "if(follow&&!atBottom){follow=false;save('follow',0);render();}"
+        "if(!follow)save('scroll',log.scrollTop);});"
+        "followButton.onclick=()=>{follow=!follow;save('follow',follow?1:0);if(follow)toBottom();render();};"
+        "document.getElementById('bottom').onclick=()=>{follow=true;save('follow',1);toBottom();render();};"
+        "</script></body></html>"
     )
+    components.html(document, height=height, scrolling=False)
 
 
 def parse_exports(text: str) -> Dict[str, str]:
@@ -246,6 +288,183 @@ def validate_submit_selection(script: Path, payload: Mapping[str, Any]) -> bool:
     return True
 
 
+def job_snapshot_path(job_id: str, script: Path) -> Path:
+    root = Path(str(CONFIG.get("job_snapshot_dir", Path(CONFIG.get("state_db")).parent / "job_snapshots")))
+    directory = root / job_id
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / (script.name if script.name else "job.slurm")
+
+
+def allowed_restart_roots() -> List[Path]:
+    roots = CONFIG.paths("script_roots") + CONFIG.paths("restart_script_roots")
+    roots.append(Path(str(CONFIG.get("job_snapshot_dir"))).resolve(strict=False))
+    return list(dict.fromkeys(path.resolve(strict=False) for path in roots))
+
+
+def validate_submit_command(command: str, cwd: str) -> tuple[List[str], Path, Path]:
+    if not command.strip():
+        raise ValueError("提交命令为空")
+    if any(token in command for token in ("\x00", "\n", "\r")):
+        raise ValueError("提交命令必须是单行 sbatch 命令")
+    try:
+        args = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ValueError("提交命令引号不完整：" + str(exc)) from exc
+    if not args or Path(args[0]).name != "sbatch":
+        raise ValueError("提交命令必须以 sbatch 开头")
+    if any(item in {";", "&&", "||", "|", ">", ">>", "<"} for item in args):
+        raise ValueError("提交命令不能包含 shell 连接符或重定向")
+    if any(item == "--wrap" or item.startswith("--wrap=") for item in args[1:]):
+        raise ValueError("安全限制：不支持 sbatch --wrap，请使用 Slurm 脚本")
+    if len(args) < 2 or args[-1].startswith("-"):
+        raise ValueError("命令最后必须是 Slurm 脚本路径")
+    workdir_text = cwd.strip() or str(PROJECT_ROOT)
+    workdir = resolve_allowed(
+        workdir_text,
+        CONFIG.paths("browse_roots") + CONFIG.paths("restart_script_roots") + CONFIG.paths("script_roots"),
+        must_exist=True,
+    )
+    if not workdir.is_dir():
+        raise ValueError("提交工作目录不是目录")
+    script_text = args[-1]
+    script_candidate = Path(script_text).expanduser()
+    if not script_candidate.is_absolute():
+        script_candidate = workdir / script_candidate
+    script = resolve_allowed(str(script_candidate), allowed_restart_roots(), must_exist=True)
+    if not script.is_file():
+        raise ValueError("Slurm 脚本不存在")
+    syntax = RUNNER.run(["bash", "-n", str(script)])
+    if not syntax.ok:
+        raise ValueError("Slurm 脚本语法检查失败：" + (syntax.stderr or "bash -n failed"))
+    args[-1] = str(script)
+    return args, workdir, script
+
+
+def reconstruct_submit_command(detail: Mapping[str, str], record: Mapping[str, Any]) -> tuple[str, str]:
+    args = ["sbatch"]
+
+    def add(option: str, value: str) -> None:
+        if value and value not in {"(null)", "None", "N/A", "Unknown", "UNLIMITED"}:
+            args.append(f"--{option}={value}")
+
+    add("account", str(detail.get("Account", "")))
+    add("qos", str(detail.get("QOS", "")))
+    add("job-name", str(detail.get("JobName", record.get("name", ""))))
+    add("partition", str(detail.get("Partition", record.get("partition", ""))))
+    add("nodelist", str(detail.get("ReqNodeList", "")))
+    add("nodes", str(detail.get("NumNodes", record.get("node_count", ""))))
+    add("ntasks", str(detail.get("NumTasks", "")))
+    add("cpus-per-task", str(detail.get("CPUs/Task", "")))
+    add("time", str(detail.get("TimeLimit", "")))
+    add("dependency", str(detail.get("Dependency", "")))
+    req_tres = str(detail.get("ReqTRES", ""))
+    memory = re.search(r"(?:^|,)mem=([^,]+)", req_tres)
+    gpu = re.search(r"(?:^|,)gres/gpu=([^,]+)", req_tres)
+    if memory:
+        add("mem", memory.group(1))
+    if gpu:
+        add("gres", "gpu:" + gpu.group(1))
+    if str(detail.get("Requeue", "")) == "1":
+        args.append("--requeue")
+    script = str(detail.get("Command", record.get("script_path", "")))
+    if script:
+        args.append(script)
+    return shlex.join(args) if len(args) > 1 else "", str(detail.get("WorkDir", ""))
+
+
+def capture_submission(record: Mapping[str, Any]) -> Dict[str, str]:
+    job_id = str(record["slurm_job_id"])
+    detail, detail_result = SLURM.job_detail(job_id)
+    detail = detail if detail_result.ok else {}
+    submit_line, submit_result = SLURM.submit_line(job_id)
+    reconstructed, reconstructed_cwd = reconstruct_submit_command(detail, record)
+    command = submit_line or reconstructed or str(record.get("submit_command", ""))
+    cwd = str(detail.get("WorkDir", "")) or reconstructed_cwd or str(record.get("submit_cwd", ""))
+
+    snapshot = ""
+    command_script = str(detail.get("Command", "")) or str(record.get("script_path", ""))
+    snapshot_name = Path(command_script).name if command_script else f"job-{job_id}.slurm"
+    target = job_snapshot_path(job_id, Path(snapshot_name))
+    snapshot_result = None
+    if target.exists():
+        snapshot = str(target)
+    else:
+        snapshot_result = SLURM.write_batch_script(job_id, target)
+    if not snapshot and snapshot_result and snapshot_result.ok and target.exists():
+        snapshot = str(target)
+    elif not snapshot and command_script:
+        try:
+            source = resolve_allowed(command_script, allowed_restart_roots(), must_exist=True)
+            shutil.copy2(source, target)
+            snapshot = str(target)
+        except (OSError, PermissionError, FileNotFoundError):
+            pass
+
+    if snapshot and command:
+        try:
+            captured_args = shlex.split(command, posix=True)
+            if captured_args and Path(captured_args[0]).name == "sbatch" and len(captured_args) > 1:
+                captured_args[-1] = snapshot
+                command = shlex.join(captured_args)
+        except ValueError:
+            pass
+
+    if submit_line and snapshot:
+        status = "complete"
+    elif command:
+        status = "partial"
+    else:
+        status = "missing"
+    return {
+        "command": command,
+        "cwd": cwd,
+        "origin": "captured",
+        "status": status,
+        "snapshot": snapshot,
+        "submit_line_error": "" if submit_result.ok else submit_result.stderr,
+        "detail_error": "" if detail_result.ok else detail_result.stderr,
+    }
+
+
+def register_webui_submission(
+    job_id: str,
+    script: Path,
+    submitted_script: Path,
+    request: SubmitRequest,
+    payload: Mapping[str, Any],
+) -> None:
+    args, workdir = SLURM.submit_args(request)
+    snapshot = job_snapshot_path(job_id, submitted_script)
+    shutil.copy2(submitted_script, snapshot)
+    # Always restart from the immutable copy that was actually submitted. This
+    # also protects ordinary (non-generated) scripts from later in-place edits.
+    args[-1] = str(snapshot)
+    info = next((item for item in script_catalog() if Path(item.path) == script), None)
+    display_name = (info.job_name or script.stem) if info else script.stem
+    record_id = STORE.save_quick_job(
+        job_id,
+        quick_job_type(info, display_name),
+        display_name,
+        "SUBMITTED",
+        str(payload.get("partition", "")),
+        int(payload.get("nodes", 1)),
+        str(payload.get("nodelist", "")),
+        str(script),
+        dict(payload),
+        "webui",
+    )
+    STORE.save_quick_job_command(
+        record_id,
+        shlex.join(args),
+        str(workdir),
+        "webui",
+        False,
+        "complete",
+        str(snapshot),
+        "WebUI",
+    )
+
+
 def submit_payload(payload: Mapping[str, Any], action: str = "SBATCH") -> Optional[str]:
     generated: Optional[Path] = None
     try:
@@ -258,19 +477,24 @@ def submit_payload(payload: Mapping[str, Any], action: str = "SBATCH") -> Option
             error_from(syntax, "脚本语法检查失败")
             return None
         prepare_slurm_output_directories(script)
-        result = SLURM.submit(
-            SubmitRequest(
-                submit_script,
-                chdir=script.parent,
-                nodelist=str(payload.get("nodelist", "")),
-                partition=str(payload.get("partition", "")),
-                nodes=int(payload.get("nodes", 1)),
-                exports=parse_exports(str(payload.get("exports", ""))),
-            )
+        request = SubmitRequest(
+            submit_script,
+            chdir=script.parent,
+            nodelist=str(payload.get("nodelist", "")),
+            partition=str(payload.get("partition", "")),
+            nodes=int(payload.get("nodes", 1)),
+            exports=parse_exports(str(payload.get("exports", ""))),
         )
+        result = SLURM.submit(request)
         job_id = SLURM.extract_job_id(result)
         STORE.record_action(action, job_id or script.name, "OK" if result.ok else "FAILED", result.stderr)
         if result.ok:
+            if job_id:
+                try:
+                    register_webui_submission(job_id, script, submit_script, request, payload)
+                except Exception as exc:
+                    STORE.record_action("WEBUI_SUBMIT_RECORD", job_id, "FAILED", str(exc))
+                    st.warning("作业已经提交成功，但保存重启命令失败：" + str(exc))
             st.success(f"提交成功，Job ID：{job_id}")
             return job_id
         error_from(result)
@@ -322,7 +546,11 @@ def preset_cards(kind: str, action_label: str, on_run) -> None:
                 st.caption("节点：" + ", ".join(split_values(str(node_text))))
             run_col, del_col = st.columns(2)
             if run_col.button(action_label, key=f"run_preset_{kind}_{preset['id']}", type="primary"):
-                on_run(payload)
+                run_payload = dict(payload)
+                run_payload["_preset_id"] = int(preset["id"])
+                run_payload["_preset_name"] = str(preset["name"])
+                run_payload["_preset_kind"] = kind
+                on_run(run_payload)
             token = f"delete_preset_{kind}_{preset['id']}"
             if del_col.button("删除", key="ask_" + token):
                 st.session_state["pending_action"] = token
@@ -356,11 +584,15 @@ def partition_node_picker(
     count_default: Optional[int] = None,
     allow_count_override: bool = False,
     count_auto_default: bool = True,
+    show_select_all: bool = False,
+    include_unavailable: bool = False,
 ) -> tuple[List[str], List[Dict[str, Any]], int, bool]:
     rows, result = SLURM.nodes(partition)
+    all_nodes = [str(row["node"]) for row in rows]
     available = [str(row["node"]) for row in rows if not str(row["state"]).startswith(("down", "drain"))]
     idle = [str(row["node"]) for row in rows if str(row["state"]).startswith("idle")]
-    options = list(dict.fromkeys(available + list(defaults)))
+    selectable = all_nodes if include_unavailable else available
+    options = list(dict.fromkeys(selectable + list(defaults)))
     widget_key = f"{key}_nodes_{partition}"
     count_key = f"{key}_count_{partition}"
     auto_key = f"{key}_count_auto_{partition}"
@@ -375,12 +607,19 @@ def partition_node_picker(
         if st.session_state.get(auto_key, True):
             st.session_state[count_key] = max(1, len(st.session_state.get(widget_key, [])))
 
-    c1, c2 = st.columns([1, 5])
+    button_columns = st.columns([1, 1, 5]) if show_select_all else st.columns([1, 5])
+    c1 = button_columns[0]
     if c1.button("全选 Idle", key=f"{key}_all_idle_{partition}", disabled=not idle):
         st.session_state[widget_key] = idle
         if st.session_state.get(auto_key, True):
             st.session_state[count_key] = max(1, len(idle))
-    c2.caption(f"{partition}：{len(rows)} 个节点，{len(idle)} 个 idle；可全选后取消个别节点。")
+    caption_column = button_columns[-1]
+    if show_select_all:
+        if button_columns[1].button("全选", key=f"{key}_all_{partition}", disabled=not options):
+            st.session_state[widget_key] = options
+            if st.session_state.get(auto_key, True):
+                st.session_state[count_key] = max(1, len(options))
+    caption_column.caption(f"{partition}：{len(rows)} 个节点，{len(idle)} 个 idle；可全选后取消个别节点。")
     selected = st.multiselect("节点", options, key=widget_key, on_change=sync_node_count)
     if not result.ok:
         st.warning("未能读取该 partition 的节点；仍可使用脚本或预设中已经保存的节点。")
@@ -539,6 +778,8 @@ def quick_submit_from_metrics(
         "model_path": "",
         "model_name": "",
     }
+    master_address, _ = SLURM.node_address(str(selected_nodes[0]))
+    payload["_master_address"] = master_address or str(selected_nodes[0])
     job_id = submit_payload(payload, action)
     if job_id:
         STORE.save_quick_job(
@@ -595,22 +836,26 @@ def sync_quick_jobs() -> tuple[List[Dict[str, Any]], set[str]]:
         existing = stored_by_job_id.get(job_id)
         nodes, _ = SLURM.job_nodes(job_id)
         node_names = [str(item["node"]) for item in nodes]
+        master_address = str(nodes[0].get("address", "")) if nodes else ""
         detail: Dict[str, str] = {}
         matched: Optional[ScriptInfo] = None
         payload = dict(existing.get("payload", {})) if existing else {}
         script_path = str(existing.get("script_path", "")) if existing else ""
-        if not payload or not script_path:
+        submitted_at = str(existing.get("submitted_at") or "") if existing else ""
+        if not payload or not script_path or not submitted_at:
             detail, detail_result = SLURM.job_detail(job_id)
+            if detail_result.ok and detail.get("SubmitTime") not in {"", "Unknown", "N/A"}:
+                submitted_at = detail["SubmitTime"].replace("T", " ")
             command = detail.get("Command", "") if detail_result.ok else ""
             command_name = Path(command).name if command else ""
             matched = next(
                 (item for item in scripts if item.path == command or Path(item.path).name == command_name),
                 None,
             )
-            if matched:
-                script_path = matched.path
+            if command:
+                script_path = matched.path if matched else command
                 payload = {
-                    "script_path": matched.path,
+                    "script_path": script_path,
                     "nodelist": ",".join(node_names),
                     "partition": str(job["partition"]),
                     "nodes": int(job["nodes"]) if str(job["nodes"]).isdigit() else len(node_names),
@@ -618,6 +863,8 @@ def sync_quick_jobs() -> tuple[List[Dict[str, Any]], set[str]]:
                     "model_path": "",
                     "model_name": "",
                 }
+        if master_address:
+            payload["_master_address"] = master_address
         if not matched and script_path:
             matched = next((item for item in scripts if item.path == script_path), None)
         STORE.save_quick_job(
@@ -631,6 +878,7 @@ def sync_quick_jobs() -> tuple[List[Dict[str, Any]], set[str]]:
             script_path,
             payload,
             str(existing.get("source", "cluster")) if existing else "cluster",
+            submitted_at=submitted_at,
         )
 
     stored = STORE.quick_jobs()
@@ -658,10 +906,29 @@ def sync_quick_jobs() -> tuple[List[Dict[str, Any]], set[str]]:
 
 
 def restart_quick_job(record: Mapping[str, Any]) -> None:
-    payload = dict(record.get("payload", {}))
-    job_id = submit_payload(payload, "QUICK_JOB_RESTART")
-    if not job_id:
+    try:
+        args, workdir, script = validate_submit_command(
+            str(record.get("submit_command", "")), str(record.get("submit_cwd", ""))
+        )
+    except Exception as exc:
+        st.error("提交命令无法执行：" + str(exc))
         return
+    run_args = list(args)
+    if not any(item == "--parsable" or item.startswith("--parsable=") for item in run_args[1:]):
+        run_args.insert(1, "--parsable")
+    result = RUNNER.run(run_args, cwd=str(workdir))
+    job_id = SLURM.extract_job_id(result)
+    STORE.record_action("QUICK_JOB_RESTART", job_id or str(record["id"]), "OK" if result.ok else "FAILED", result.stderr)
+    if not result.ok or not job_id:
+        error_from(result, "再次启动失败")
+        return
+    payload = dict(record.get("payload", {}))
+    payload.update({
+        "script_path": str(script),
+        "partition": str(record.get("partition", payload.get("partition", ""))),
+        "nodelist": str(record.get("nodelist", payload.get("nodelist", ""))),
+        "nodes": int(record.get("node_count", payload.get("nodes", 1))),
+    })
     STORE.save_quick_job(
         job_id,
         str(record["job_type"]),
@@ -675,9 +942,159 @@ def restart_quick_job(record: Mapping[str, Any]) -> None:
         str(record.get("source", "quick")),
         int(record["id"]),
     )
+    st.success(f"再次启动成功，新 Job ID：{job_id}")
     waiting = dict(st.session_state.get("quick_job_waiting", {}))
     waiting[job_id] = time.time() + 30
     st.session_state["quick_job_waiting"] = waiting
+
+
+def render_node_connect_control(record: Mapping[str, Any], enabled: bool) -> None:
+    prefix = str(CONFIG.get("node_connect_command", "")).strip()
+    payload = dict(record.get("payload", {}))
+    address = str(payload.get("_master_address", "")).strip()
+    job_id = str(record.get("slurm_job_id", ""))
+    if not (prefix and address and job_id):
+        st.caption("尚无连接信息")
+        return
+    port = shell_port(
+        job_id,
+        int(CONFIG.get("shell_port_base", 10000)),
+        int(CONFIG.get("shell_port_modulo", 40000)),
+    )
+    command = f'{prefix} {address} {port} "cd /workspace"'
+    js_command = json.dumps(command, ensure_ascii=False).replace("</", "<\\/")
+    disabled = " disabled" if not enabled else ""
+    components.html(
+        "<!doctype html><html><head><style>"
+        "html,body{margin:0;padding:0;background:transparent;font:13px sans-serif;}"
+        ".wrap{display:flex;align-items:center;gap:6px;height:36px;}"
+        "code{padding:4px 6px;background:#f2f4f7;border-radius:4px;}"
+        "button{border:1px solid #c8ccd2;background:white;border-radius:6px;padding:5px 8px;cursor:pointer;}"
+        "button:disabled{opacity:.45;cursor:not-allowed}.ok{color:#15803d;font-size:12px}"
+        "</style></head><body><div class='wrap'>"
+        f'<code title="{html.escape(command, quote=True)}">{port}</code>'
+        f"<button id='copy'{disabled}>复制</button><span id='status'></span></div>"
+        "<script>const value=" + js_command + ";"
+        "document.getElementById('copy').onclick=async()=>{"
+        "let ok=false;try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(value);ok=true;}}catch(e){}"
+        "if(!ok){const t=document.createElement('textarea');t.value=value;t.style.position='fixed';t.style.opacity='0';"
+        "document.body.appendChild(t);t.focus();t.select();ok=document.execCommand('copy');t.remove();}"
+        "const s=document.getElementById('status');s.textContent=ok?'已复制':'复制失败';s.className='ok';};"
+        "</script></body></html>",
+        height=40,
+        scrolling=False,
+    )
+
+
+def save_captured_submission(record: Mapping[str, Any], captured: Mapping[str, str]) -> None:
+    STORE.save_quick_job_command(
+        int(record["id"]),
+        str(captured.get("command", "")),
+        str(captured.get("cwd", "")),
+        "captured",
+        False,
+        str(captured.get("status", "missing")),
+        str(captured.get("snapshot", "")),
+        str(record.get("submit_method", "Terminal")),
+    )
+
+
+def submission_command_editor(record: Mapping[str, Any]) -> None:
+    record_id = int(record["id"])
+    auto_token = f"{record_id}:{record.get('slurm_job_id', '')}"
+    should_auto_capture = (
+        not str(record.get("submit_command", "")).strip()
+        or (
+            str(record.get("submit_method", "Terminal")) == "Terminal"
+            and not bool(record.get("command_user_edited"))
+        )
+    )
+    if should_auto_capture and st.session_state.get("quick_command_auto_captured") != auto_token:
+        with st.spinner("正在自动捕获提交参数和批处理脚本……"):
+            save_captured_submission(record, capture_submission(record))
+        st.session_state["quick_command_auto_captured"] = auto_token
+        st.rerun()
+
+    status_labels = {"complete": "高完整度", "partial": "部分完整", "missing": "缺失", "validated": "人工校验"}
+    st.caption(
+        f"提交方式：{record.get('submit_method', 'Terminal')} · "
+        f"命令来源：{record.get('command_origin') or '-'} · "
+        f"捕获状态：{status_labels.get(str(record.get('capture_status', 'missing')), record.get('capture_status', 'missing'))}"
+    )
+    st.caption("完整度针对 Slurm 提交命令和脚本；提交 shell 中未显式写入命令的临时环境变量仍可能无法恢复。")
+    command = st.text_area(
+        "sbatch 命令",
+        value=str(record.get("submit_command", "")),
+        height=180,
+        key=f"quick_command_value_{record_id}_{record.get('updated_at', '')}",
+    )
+    cwd = st.text_input(
+        "提交工作目录",
+        value=str(record.get("submit_cwd", "")),
+        key=f"quick_command_cwd_{record_id}_{record.get('updated_at', '')}",
+    )
+    save_col, capture_col, close_col = st.columns(3)
+    if save_col.button("保存修改", type="primary", key=f"save_quick_command_{record_id}"):
+        try:
+            validate_submit_command(command, cwd)
+            STORE.save_quick_job_command(
+                record_id, command.strip(), cwd.strip(), "user", True, "validated",
+                str(record.get("script_snapshot", "")), str(record.get("submit_method", "Terminal")),
+            )
+            st.success("提交命令已验证并保存。")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if capture_col.button("现场捕获参数并补填", key=f"capture_quick_command_{record_id}"):
+        with st.spinner("正在读取 SubmitLine、作业参数和批处理脚本……"):
+            st.session_state["quick_command_capture_preview"] = {
+                "record_id": record_id,
+                **capture_submission(record),
+            }
+        st.rerun()
+    if close_col.button("关闭", key=f"close_quick_command_{record_id}"):
+        st.session_state.pop("quick_command_record_id", None)
+        st.session_state.pop("quick_command_capture_preview", None)
+        st.session_state.pop("quick_command_auto_captured", None)
+        st.rerun()
+
+    preview = st.session_state.get("quick_command_capture_preview")
+    if preview and int(preview.get("record_id", -1)) == record_id:
+        st.warning("现场捕获结果将覆盖当前命令。确认前请检查差异；当前版本会自动保存在历史记录中。")
+        old_col, new_col = st.columns(2)
+        old_col.caption("当前保存的命令")
+        old_col.code(str(record.get("submit_command", "")) or "（空）", language="bash")
+        new_col.caption("现场捕获的命令")
+        new_col.code(str(preview.get("command", "")) or "（未捕获到）", language="bash")
+        confirm = st.checkbox("确认使用现场结果覆盖当前命令", key=f"confirm_capture_{record_id}")
+        if st.button(
+            "确认覆盖",
+            type="primary",
+            disabled=not (confirm and preview.get("command")),
+            key=f"apply_capture_{record_id}",
+        ):
+            save_captured_submission(record, preview)
+            st.session_state.pop("quick_command_capture_preview", None)
+            st.session_state["quick_command_auto_captured"] = auto_token
+            st.success("已使用现场捕获结果覆盖，旧命令已保存到历史记录。")
+            st.rerun()
+
+    history = STORE.quick_job_command_history(record_id)
+    if history:
+        with st.expander("命令修改历史", expanded=False):
+            for item in history:
+                st.caption(f"{item['created_at']} · {item['command_origin']} · cwd={item['submit_cwd'] or '-'}")
+                st.code(str(item["submit_command"]), language="bash")
+
+
+def show_submission_command_editor(record: Mapping[str, Any]) -> None:
+    if hasattr(st, "dialog"):
+        dialog = st.dialog("提交命令")(submission_command_editor)
+        dialog(record)
+    else:
+        st.subheader("提交命令")
+        with st.container(border=True):
+            submission_command_editor(record)
 
 
 def render_quick_job_manager() -> None:
@@ -694,31 +1111,53 @@ def render_quick_job_manager() -> None:
         records,
         key=lambda item: (str(item["slurm_job_id"]) not in (live_ids | pending_ids), -int(item["id"])),
     )
-    header = st.columns([1.5, 1.1, 0.8, 2.4, 1.2, 1.2, 2.2])
-    for column, label in zip(header, ("作业类型", "Job ID", "节点数", "任务名称", "Partition", "状态", "操作")):
+    submission_presets = [
+        preset
+        for kind in ("slurm", "vllm", "keepalive")
+        for preset in STORE.presets(kind)
+    ]
+    widths = [1.0, 0.7, 0.75, 0.5, 1.3, 1.05, 0.8, 1.15, 0.7, 1.25, 0.8, 1.75]
+    header = st.columns(widths)
+    for column, label in zip(
+        header,
+        ("作业类型", "提交方式", "Job ID", "节点数", "任务名称", "提交预设", "Partition", "最近提交时间", "状态", "节点连接", "提交命令", "操作"),
+    ):
         column.caption(label)
     for record in records:
         job_id = str(record["slurm_job_id"])
         is_live = job_id in live_ids
         is_pending = job_id in pending_ids
-        columns = st.columns([1.5, 1.1, 0.8, 2.4, 1.2, 1.2, 2.2])
+        columns = st.columns(widths)
         columns[0].write(str(record["job_type"]))
-        columns[1].code(job_id, language="text")
+        columns[1].write(str(record.get("submit_method", "Terminal")))
+        columns[2].code(job_id, language="text")
         tooltip = html.escape(str(record.get("nodelist", "")) or "尚未分配节点", quote=True)
-        columns[2].markdown(
+        columns[3].markdown(
             f'<span title="{tooltip}" style="cursor:help;border-bottom:1px dotted #888">{int(record["node_count"])}</span>',
             unsafe_allow_html=True,
         )
-        columns[3].write(str(record["name"]))
-        columns[4].write(str(record["partition"]))
-        columns[5].write(str(record["state"]))
-        with columns[6]:
+        columns[4].write(str(record["name"]))
+        payload = record.get("payload", {})
+        preset_name = submitted_preset_name(payload, submission_presets) if isinstance(payload, dict) else ""
+        columns[5].write(preset_name)
+        columns[6].write(str(record["partition"]))
+        columns[7].write(str(record.get("submitted_at") or "-"))
+        columns[8].write(str(record["state"]))
+        with columns[9]:
+            render_node_connect_control(record, is_live)
+        command_label = "查看" if record.get("submit_command") else "捕获"
+        if columns[10].button(command_label, key=f"quick_command_{record['id']}"):
+            st.session_state["quick_command_record_id"] = int(record["id"])
+            st.session_state.pop("quick_command_capture_preview", None)
+            st.session_state.pop("quick_command_auto_captured", None)
+            st.rerun()
+        with columns[11]:
             stop_col, restart_col, delete_col = st.columns(3)
             token = f"quick_cancel_{record['id']}"
             if stop_col.button("取消作业", key="ask_" + token, disabled=not is_live):
                 st.session_state["pending_action"] = token
                 st.rerun()
-            can_restart = not (is_live or is_pending) and bool(record.get("payload")) and bool(record.get("script_path"))
+            can_restart = not (is_live or is_pending) and bool(str(record.get("submit_command", "")).strip())
             if restart_col.button("再次启动", key=f"quick_restart_{record['id']}", disabled=not can_restart):
                 restart_quick_job(record)
                 st.rerun()
@@ -740,6 +1179,13 @@ def render_quick_job_manager() -> None:
                 st.session_state.pop("pending_action", None)
                 st.rerun()
         st.divider()
+    selected_command_id = st.session_state.get("quick_command_record_id")
+    if selected_command_id:
+        selected_record = next((item for item in records if int(item["id"]) == int(selected_command_id)), None)
+        if selected_record:
+            show_submission_command_editor(selected_record)
+        else:
+            st.session_state.pop("quick_command_record_id", None)
     cancelling = {
         str(job_id): float(deadline)
         for job_id, deadline in dict(st.session_state.get("quick_job_cancelling", {})).items()
@@ -823,7 +1269,6 @@ def metric_quick_actions(selected_nodes: Sequence[str], partition: str) -> None:
         if job_id:
             st.session_state["vllm_wait_job"] = job_id
             st.session_state["vllm_recent_job"] = job_id
-    render_quick_job_manager()
 
 
 def run_metric_payload(payload: Mapping[str, Any]) -> None:
@@ -852,11 +1297,17 @@ def metric_presets_editor(default_partition: str, eligible: Sequence[str]) -> No
         payload = editing["payload"] if editing else {}
         suffix = str(editing["id"]) if editing else "new"
         name = st.text_input("新采样组名称" if not editing else "名称", value=editing["name"] if editing else "", key="metrics_name_" + suffix)
-        preferred = str(payload.get("partition", default_partition))
+        preferred = str(payload.get("partition", "5090-eth-2" if not editing else default_partition))
         partitions = partition_options(preferred)
         partition = st.selectbox("Partition", partitions, key="metrics_partition_" + suffix) if partitions else preferred
         nodes_default = split_values(str(payload.get("nodes", "")))
-        nodes, _, _, _ = partition_node_picker(partition, "metrics_" + suffix, nodes_default) if partition else ([], [], 0, True)
+        nodes, _, _, _ = partition_node_picker(
+            partition,
+            "metrics_" + suffix,
+            nodes_default,
+            show_select_all=True,
+            include_unavailable=True,
+        ) if partition else ([], [], 0, True)
         method_labels = {"自动（exporter → srun）": "auto", "仅 exporter": "direct", "仅 srun": "srun"}
         current_method = str(payload.get("method", "auto"))
         current_label = next((label for label, value in method_labels.items() if value == current_method), list(method_labels)[0])
@@ -892,6 +1343,10 @@ def page_cluster() -> None:
     st.subheader("保存的采样组")
     preset_cards("metrics", "立即采样", run_metric_payload)
     metric_presets_editor(partition, eligible)
+
+    st.divider()
+    render_quick_job_manager()
+    st.divider()
 
     with st.expander("临时采样", expanded=False):
         selected = st.multiselect("实时采样节点", eligible, default=eligible[: min(4, len(eligible))])
@@ -1016,19 +1471,25 @@ def render_slurm_detail_and_logs(job: Mapping[str, str], prefix: str, show_detai
             column.caption(path)
             try:
                 with column:
-                    scroll_text(tail_text(Path(path), 300))
+                    scroll_text(tail_text(Path(path), 300), tail_token)
             except OSError as exc:
                 column.warning(str(exc))
 
 
 def job_card(
     job: Mapping[str, str], prefix: str, allow_cancel: bool = True,
-    show_details: bool = True, show_logs: bool = False,
+    show_details: bool = True, show_logs: bool = False, preset_name: str = "",
+    node_connect_record: Optional[Mapping[str, Any]] = None,
 ) -> None:
     with st.container(border=True):
         st.markdown(f"**{job['job_id']} · {job['name']}**")
+        if preset_name:
+            st.caption("提交预设：" + preset_name)
         st.caption(f"{job['user']} · {job['partition']} · {job['state']} · {job['elapsed']}/{job['limit']} · {job['nodes']} nodes")
         st.caption("使用节点/排队原因：" + str(job.get("reason_or_nodes", "-")))
+        if node_connect_record is not None:
+            st.caption("节点连接")
+            render_node_connect_control(node_connect_record, str(job.get("state", "")).upper() == "RUNNING")
         if show_details:
             render_slurm_detail_and_logs(job, prefix)
         elif show_logs:
@@ -1052,11 +1513,46 @@ def job_card(
                     st.session_state.pop("pending_action", None); st.rerun()
 
 
+def submitted_preset_name(
+    payload: Mapping[str, Any], presets: Sequence[Mapping[str, Any]]
+) -> str:
+    recorded = str(payload.get("_preset_name", "")).strip()
+    if recorded:
+        return recorded
+    # Best-effort compatibility for jobs submitted before preset metadata was
+    # introduced. Only accept an unambiguous exact match of submit parameters.
+    keys = ("script_path", "partition", "nodelist", "nodes", "exports")
+    matches = []
+    for preset in presets:
+        candidate = preset.get("payload", {})
+        if isinstance(candidate, Mapping) and all(
+            str(candidate.get(key, "")) == str(payload.get(key, "")) for key in keys
+        ):
+            matches.append(str(preset.get("name", "")))
+    return matches[0] if len(matches) == 1 else ""
+
+
+def job_connection_record(
+    job: Mapping[str, str], stored: Mapping[str, Any]
+) -> Dict[str, Any]:
+    record = dict(stored)
+    record["slurm_job_id"] = str(job["job_id"])
+    payload = dict(record.get("payload", {}))
+    if str(job.get("state", "")).upper() == "RUNNING":
+        nodes, result = SLURM.job_nodes(str(job["job_id"]), limit=1)
+        if result.ok and nodes:
+            payload["_master_address"] = str(nodes[0].get("address") or nodes[0].get("node", ""))
+    record["payload"] = payload
+    return record
+
+
 def render_job_management() -> None:
     st.subheader("作业管理")
     users = users_value()
     user_list = split_values(users)
     jobs = active_jobs(users)
+    stored_jobs = {str(item["slurm_job_id"]): item for item in STORE.quick_jobs()}
+    slurm_presets = STORE.presets("slurm")
     columns = st.columns(max(1, len(user_list)))
     for index, user in enumerate(user_list):
         with columns[index]:
@@ -1065,7 +1561,15 @@ def render_job_management() -> None:
             if not owned:
                 st.caption("暂无活动作业")
             for job in owned:
-                job_card(job, user)
+                stored = stored_jobs.get(str(job["job_id"]), {})
+                payload = stored.get("payload", {}) if isinstance(stored, dict) else {}
+                preset_name = submitted_preset_name(payload, slurm_presets) if isinstance(payload, dict) else ""
+                job_card(
+                    job,
+                    user,
+                    preset_name=preset_name,
+                    node_connect_record=job_connection_record(job, stored),
+                )
     live_ids = {job["job_id"] for job in jobs}
     cancelling = dict(st.session_state.get("cancelling_jobs", {}))
     waiting = [job_id for job_id, deadline in cancelling.items() if job_id in live_ids and time.time() < float(deadline)]
@@ -1186,7 +1690,7 @@ def task_resources(task_id: int) -> None:
                         auto = st.toggle("每 5 秒刷新", key=f"log_auto_{resource['id']}")
                         if auto and st_autorefresh:
                             st_autorefresh(interval=5000, key=f"refresh_{resource['id']}")
-                        scroll_text(tail_text(path, int(lines)))
+                        scroll_text(tail_text(path, int(lines)), f"task_{task_id}_resource_{resource['id']}")
                     except Exception as exc:
                         st.info("等待日志文件：" + str(exc))
                 else:
@@ -1299,7 +1803,7 @@ def independent_log_tracking() -> None:
                     st_autorefresh(interval=5000, key=f"independent_refresh_{item['id']}")
                 try:
                     path = resolve_allowed(item["path"], CONFIG.paths("browse_roots"), must_exist=True)
-                    scroll_text(tail_text(path, int(lines)))
+                    scroll_text(tail_text(path, int(lines)), f"independent_{item['id']}")
                 except Exception as exc:
                     st.info("等待日志文件：" + str(exc))
 
@@ -1474,32 +1978,33 @@ def page_vllm() -> None:
             st.dataframe(st.session_state["vllm_model_detections"], use_container_width=True, hide_index=True)
     style = st.radio("导出格式", ["python", "json", "lines"], horizontal=True)
     st.code(format_endpoints(endpoints, style), language="python" if style == "python" else "text")
+    endpoint_check_signature = json.dumps(
+        {"endpoints": endpoints, "model": model}, ensure_ascii=False, sort_keys=True
+    )
     if st.button("并发检查 Endpoint", disabled=not endpoints):
         token = os.environ.get(str(CONFIG.get("vllm_api_token_env", "VLLM_API_TOKEN")), "")
         st.session_state["endpoint_checks"] = check_endpoints(endpoints, model, token)
-    if st.session_state.get("endpoint_checks"):
-        checks = st.session_state["endpoint_checks"]
+        st.session_state["endpoint_checks_signature"] = endpoint_check_signature
+    checks = (
+        st.session_state.get("endpoint_checks", [])
+        if st.session_state.get("endpoint_checks_signature") == endpoint_check_signature
+        else []
+    )
+    if checks:
         st.metric("可用 Endpoint", f"{sum(bool(x['ok']) for x in checks)}/{len(checks)}")
         st.dataframe(checks, use_container_width=True, hide_index=True)
     with st.expander("更新 YAML 配置"):
         roots = CONFIG.paths("editable_config_roots")
-        root = st.selectbox("允许的配置根目录", [str(path) for path in roots], key="yaml_root") if roots else ""
-        directory = st.text_input("YAML 所在目录", value=root, key="yaml_directory")
-        if st.button("列出该目录的 YAML 文件", key="yaml_list", disabled=not directory):
-            try:
-                folder = resolve_allowed(directory, roots, must_exist=True)
-                if not folder.is_dir():
-                    raise ValueError("请输入目录，而不是文件")
-                st.session_state["yaml_files"] = [
-                    str(path) for path in sorted(folder.iterdir())
-                    if path.is_file() and path.suffix.lower() in {".yaml", ".yml"}
-                ]
-            except Exception as exc:
-                st.error(str(exc))
-        yaml_files = st.session_state.get("yaml_files", [])
-        target = st.selectbox("YAML 文件", yaml_files, key="yaml_target") if yaml_files else ""
+        st.caption("允许更新的配置根目录：" + ("、".join(str(path) for path in roots) if roots else "未配置"))
+        target = st.text_input(
+            "YAML 文件地址",
+            placeholder="请输入 .yaml / .yml 文件的绝对路径",
+            key="yaml_target_path",
+        ).strip()
         if st.button("识别 Endpoint 配置位置", key="yaml_scan", disabled=not target):
             try:
+                if not Path(target).expanduser().is_absolute():
+                    raise ValueError("请输入 YAML 文件的绝对路径")
                 st.session_state["yaml_blocks"] = find_yaml_endpoint_blocks(target, roots)
                 st.session_state["yaml_scanned_target"] = target
             except Exception as exc:
@@ -1517,13 +2022,37 @@ def page_vllm() -> None:
             st.caption("当前内容")
             st.code(str(block["text"]), language="yaml")
             try:
-                preview = preview_yaml_endpoint_update(target, block, endpoints, roots)
-                preview_lines = preview.splitlines()[int(block["start"]) - 1:int(block["start"]) - 1 + len(endpoints) + 1]
+                drop_failed = st.checkbox(
+                    "去掉检查 Endpoint 失败的节点",
+                    value=True,
+                    key="yaml_drop_failed_endpoints",
+                )
+                replacement_endpoints = select_healthy_endpoints(endpoints, checks, drop_failed)
+                if drop_failed and not checks:
+                    st.warning("当前 Endpoint 列表尚未完成检查。请先点击“并发检查 Endpoint”，或取消该选项以使用全部 Endpoint。")
+                elif drop_failed:
+                    st.caption(
+                        f"检查通过 {len(replacement_endpoints)}/{len(endpoints)} 个；"
+                        f"替换时将排除 {len(endpoints) - len(replacement_endpoints)} 个失败 Endpoint。"
+                    )
+                preview = preview_yaml_endpoint_update(target, block, replacement_endpoints, roots)
+                preview_start = int(block["start"]) - 1
+                replacement_line_count = 1 if block["style"] == "inline" else len(replacement_endpoints) + 1
+                preview_lines = preview.splitlines()[preview_start:preview_start + replacement_line_count]
                 st.caption("替换预览")
                 st.code("\n".join(preview_lines), language="yaml")
-                confirm = st.checkbox("我已核对匹配位置和替换内容，并同意创建备份", key="yaml_update_confirm")
-                if st.button("写入 YAML Endpoint 列表", type="primary", disabled=not (confirm and endpoints), key="yaml_write"):
-                    backup = update_yaml_endpoint_block(target, block, endpoints, roots)
+                preview_identity = str(abs(hash((target, str(block["id"]), tuple(replacement_endpoints)))))
+                confirm = st.checkbox(
+                    "我已核对匹配位置和替换内容，并同意创建备份",
+                    key="yaml_update_confirm_" + preview_identity,
+                )
+                if st.button(
+                    "写入 YAML Endpoint 列表",
+                    type="primary",
+                    disabled=not (confirm and replacement_endpoints),
+                    key="yaml_write_" + preview_identity,
+                ):
+                    backup = update_yaml_endpoint_block(target, block, replacement_endpoints, roots)
                     st.success(f"更新完成，原文件备份：{backup}")
                     st.session_state.pop("yaml_blocks", None)
             except Exception as exc:
@@ -1570,7 +2099,7 @@ PAGES = {
 }
 
 with st.sidebar:
-    st.title("AIHPC"); st.caption("Slurm Manager · 0.6.0")
+    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.5")
     page = st.radio("导航", list(PAGES), label_visibility="collapsed")
     st.divider(); health = SLURM.health(); st.metric("Slurm CLI", f"{sum(bool(x['available']) for x in health)}/{len(health)}")
     st.caption(f"用户：{CONFIG.get('default_user', '')}")

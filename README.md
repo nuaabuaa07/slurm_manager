@@ -5,10 +5,17 @@
 ## 已实现
 
 - 按 partition 查看节点和 CPU 分配；优先通过 node-exporter/DCGM 采样实时指标，失败时快速回退 `srun`。采样结果同步显示节点最新的 Slurm 状态。
-- 保存、修改、删除多组节点采样配置并一键执行。
+- 保存、修改、删除多组节点采样配置并一键执行；新建采样组默认使用 `5090-eth-2`，节点可“全选 Idle”或“全选”。
 - 采样结果可勾选多台服务器，快捷提交 GPU/CPU 保活、普通 Slurm 或 vLLM 作业；每个入口会记住上次选择的脚本。
-- 快捷作业列表会以 Slurm 当前状态为准同步到 SQLite，支持取消、按原参数再次启动和删除已结束记录。
+- “集群资源”页面常驻显示快捷作业列表，并以 Slurm 当前状态为准同步到 SQLite；无需先采样即可取消、按原参数再次启动和删除已结束记录。
+- 所有日志框支持自动跟随尾部、向上滚动时暂停、继续跟随、回到底部以及持久的收起/展开状态。
+- 快捷作业列表显示 Ray driver 节点连接端口，并可复制由 `node_connect_command`、master IP、端口和工作目录组成的完整连接命令。
+- 快捷作业列表记录最近提交时间；状态轮询不会改变该时间，再次启动成功后才更新。
+- 快捷作业列表区分 WebUI/Terminal 提交；每条记录可查看、现场捕获、校验和修改 `sbatch` 命令，并保存批处理脚本快照及命令历史后安全地再次启动。
 - 动态扫描 `script_roots` 下的 `.slurm`，并支持 Slurm 提交预设的增删改和一键提交。
+- 通过预设提交的作业会记录提交当时的预设 ID 和名称，并在“提交 Slurm → 作业管理”的作业实例中显示预设名称。
+- “提交 Slurm → 作业管理”的运行中作业会显示节点连接端口，并可一键复制完整连接命令。
+- “集群资源 → 快捷作业列表”提供“提交预设”列；没有预设或无法唯一识别时保持为空。
 - 提交页先选 partition、再多选该 partition 节点，可一键全选 idle 节点；节点数随选择自动计算，也允许手工覆盖，并拦截节点与 partition 冲突。
 - `sbatch` 会显式设置 `--chdir` 到 Slurm 脚本所在目录，保证同目录的 `dj-ray*.bash` 和相对日志路径可以正常解析。
 - 作业管理合并到提交页，按多个用户分列平铺活动 Job；直接展示详情、节点和标准输出/错误 Tail，`scancel` 后短时自动刷新直到作业消失。
@@ -60,10 +67,13 @@ ssh -L 8501:127.0.0.1:8501 user@development-host
 复制 `config.example.json` 为 `config.json` 后重点检查：
 
 - `script_roots`：允许提交的 Slurm 脚本目录。
+- `restart_script_roots`：允许“再次启动”命令引用的外部 Slurm 脚本目录。
+- `job_snapshot_dir`：Terminal 作业现场捕获及 WebUI 作业生成脚本的快照目录。
 - `browse_roots`：日志和结果浏览白名单。
 - `editable_config_roots`：允许 endpoint 更新的 YAML 配置根目录。
 - `default_partitions`：常用 partition。
 - `auth_session_hours`：浏览器登录保持时间，默认 6 小时。
+- `node_connect_command`：快捷作业列表中复制的计算节点连接命令前缀，例如 `python /path/to/connect.py`。
 
 `${PROJECT_ROOT}`、`${USER}` 和其他环境变量会自动展开。vLLM token 不写进配置文件；如接口需要认证，设置：
 
@@ -85,7 +95,7 @@ export VLLM_API_TOKEN='...'
 
 ## Endpoint 配置安全更新
 
-在 vLLM 页面选择允许根目录下某个目录中的 `.yaml` / `.yml` 文件。平台用正则查找包含 `/v1/chat/completions` 或 `/v1/completions` 的字段，显示字段名、行号、当前内容和替换预览；只有用户确认后才写入，并先创建同目录带时间戳的 `.bak.*`。
+在 vLLM 页面直接填写允许根目录下 `.yaml` / `.yml` 文件的绝对路径。平台用正则查找包含 `/v1/chat/completions` 或 `/v1/completions` 的字段，显示字段名、行号、当前内容和替换预览。替换预览默认排除当前 Endpoint 检查失败的地址；尚未检查时需先执行检查，或取消过滤后使用全部 Endpoint。只有用户确认后才写入，并先创建同目录带时间戳的 `.bak.*`。
 
 ## 验证
 

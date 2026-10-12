@@ -117,7 +117,7 @@ class SlurmService:
         result = self.runner.run(["scontrol", "show", "node", "-o", node])
         return _key_values(result.stdout).get("NodeAddr", ""), result
 
-    def job_nodes(self, job_id: str) -> Tuple[List[Dict[str, str]], CommandResult]:
+    def job_nodes(self, job_id: str, limit: int = 0) -> Tuple[List[Dict[str, str]], CommandResult]:
         detail, detail_result = self.job_detail(job_id)
         expression = ""
         for key in ("NodeList", "ReqNodeList", "BatchHost"):
@@ -128,13 +128,15 @@ class SlurmService:
         if not expression:
             return [], detail_result
         nodes, expand_result = self.expand_nodelist(expression)
+        if limit > 0:
+            nodes = nodes[:limit]
         output = []
         for node in nodes:
             address, _ = self.node_address(node)
             output.append({"node": node, "address": address or node})
         return output, expand_result
 
-    def submit(self, request: SubmitRequest) -> CommandResult:
+    def submit_args(self, request: SubmitRequest) -> Tuple[List[str], Path]:
         script = request.script.resolve(strict=True)
         # Preserve the behavior of manually running sbatch from the script's
         # own directory. Many existing jobs reference sibling files such as
@@ -158,7 +160,27 @@ class SlurmService:
                 clean.append(key + "=" + value)
             args.append("--export=ALL," + ",".join(clean))
         args.append(str(script))
-        return self.runner.run(args)
+        return args, workdir
+
+    def submit(self, request: SubmitRequest) -> CommandResult:
+        args, workdir = self.submit_args(request)
+        return self.runner.run(args, cwd=str(workdir))
+
+    def submit_line(self, job_id: str) -> Tuple[str, CommandResult]:
+        self._validate_job_id(job_id)
+        result = self.runner.run(
+            ["sacct", "-X", "-n", "-P", "-j", job_id, "-o", "JobIDRaw,SubmitLine%1000"]
+        )
+        for line in result.stdout.splitlines():
+            raw_id, _, submit_line = line.partition("|")
+            if raw_id.strip() == job_id and submit_line.strip():
+                return submit_line.strip(), result
+        return "", result
+
+    def write_batch_script(self, job_id: str, target: Path) -> CommandResult:
+        self._validate_job_id(job_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return self.runner.run(["scontrol", "write", "batch_script", job_id, str(target)])
 
     def cancel(self, job_id: str) -> CommandResult:
         self._validate_job_id(job_id)
@@ -166,7 +188,12 @@ class SlurmService:
 
     @staticmethod
     def extract_job_id(result: CommandResult) -> str:
-        return result.stdout.strip().split(";", 1)[0].strip()
+        output = result.stdout.strip()
+        parsable = output.split(";", 1)[0].strip()
+        if parsable.isdigit() or JOB_ID_RE.match(parsable):
+            return parsable
+        match = re.search(r"(?:Submitted\s+batch\s+job\s+)?([0-9]+(?:_[0-9]+)?)", output)
+        return match.group(1) if match else ""
 
     @staticmethod
     def _validate_job_id(job_id: str) -> None:

@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ from slurm_manager.vllm import (
     find_yaml_endpoint_blocks,
     infer_vllm_settings,
     preview_yaml_endpoint_update,
+    select_healthy_endpoints,
 )
 
 
@@ -63,6 +65,16 @@ class SlurmTests(unittest.TestCase):
     def test_log_pattern(self):
         self.assertEqual(expand_slurm_log_pattern("log/%j-%t.log", "42"), "log/42-0.log")
 
+    def test_submit_line_and_standard_sbatch_output(self):
+        runner = FakeRunner("42|sbatch --nodes=2 job.slurm\n")
+        line, result = SlurmService(runner).submit_line("42")
+        self.assertTrue(result.ok)
+        self.assertEqual(line, "sbatch --nodes=2 job.slurm")
+        self.assertEqual(
+            SlurmService.extract_job_id(CommandResult([], 0, "Submitted batch job 43\n", "", 0.01)),
+            "43",
+        )
+
 
 class FileTests(unittest.TestCase):
     def test_allowed_path_and_jsonl(self):
@@ -83,6 +95,34 @@ class FileTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    def test_quick_job_schema_migrates_existing_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "old.db"
+            with sqlite3.connect(database) as db:
+                db.execute(
+                    """CREATE TABLE quick_jobs (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                       slurm_job_id TEXT NOT NULL UNIQUE,
+                       job_type TEXT NOT NULL,name TEXT NOT NULL,state TEXT NOT NULL,
+                       partition TEXT NOT NULL DEFAULT '',node_count INTEGER NOT NULL DEFAULT 0,
+                       nodelist TEXT NOT NULL DEFAULT '',script_path TEXT NOT NULL DEFAULT '',
+                       payload TEXT NOT NULL DEFAULT '{}',source TEXT NOT NULL DEFAULT 'cluster'
+                    )"""
+                )
+                db.execute(
+                    """INSERT INTO quick_jobs(
+                       slurm_job_id,job_type,name,state,partition,node_count,nodelist,
+                       script_path,payload,source
+                    ) VALUES('42','Slurm','old','RUNNING','gpu',1,'n1','/tmp/a.slurm','{}','quick')"""
+                )
+            store = StateStore(database)
+            record = store.quick_jobs()[0]
+            self.assertEqual(record["submit_method"], "WebUI")
+            self.assertIn("submit_command", record)
+            self.assertIn("submitted_at", record)
+
     def test_auth_token_expiry_and_password_rotation(self):
         token = make_auth_token("secret", now=100)
         self.assertTrue(valid_auth_token(token, "secret", now=100 + 21599))
@@ -106,6 +146,12 @@ class UtilityTests(unittest.TestCase):
         endpoints = build_endpoints(["10.0.0.1"], ports)
         self.assertEqual(len(endpoints), 4)
         self.assertIn("ENDPOINTS = [", format_endpoints(endpoints))
+        checks = [
+            {"endpoint": endpoints[0], "ok": True},
+            {"endpoint": endpoints[1], "ok": False},
+        ]
+        self.assertEqual(select_healthy_endpoints(endpoints, checks), [endpoints[0]])
+        self.assertEqual(select_healthy_endpoints(endpoints, checks, False), endpoints)
 
     def test_safe_endpoint_update_creates_backup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -184,17 +230,37 @@ class UtilityTests(unittest.TestCase):
             self.assertEqual(store.setting("quick_script"), "/tmp/job.slurm")
             quick_id = store.save_quick_job(
                 "100", "vLLM", "server", "RUNNING", "gpu", 2, "n1,n2",
-                "/tmp/vllm.slurm", {"script_path": "/tmp/vllm.slurm", "nodes": 2}, "quick",
+                "/tmp/vllm.slurm", {"script_path": "/tmp/vllm.slurm", "nodes": 2},
+                "quick", None, "2026-01-01 10:00:00",
             )
             self.assertEqual(store.quick_jobs()[0]["payload"]["nodes"], 2)
+            store.save_quick_job(
+                "100", "vLLM", "server", "RUNNING", "gpu", 2, "n1,n2",
+                "/tmp/vllm.slurm", {"script_path": "/tmp/vllm.slurm", "nodes": 2},
+                "quick", None, "2026-02-01 10:00:00",
+            )
+            self.assertEqual(store.quick_jobs()[0]["submitted_at"], "2026-01-01 10:00:00")
             store.update_quick_job_state(quick_id, "CANCELLED")
             self.assertEqual(store.quick_jobs()[0]["state"], "CANCELLED")
             store.save_quick_job(
                 "101", "vLLM", "server", "SUBMITTED", "gpu", 2, "n1,n2",
                 "/tmp/vllm.slurm", {"script_path": "/tmp/vllm.slurm", "nodes": 2},
-                "quick", quick_id,
+                "quick", quick_id, "2026-03-01 10:00:00",
             )
             self.assertEqual(store.quick_jobs()[0]["slurm_job_id"], "101")
+            self.assertEqual(store.quick_jobs()[0]["submitted_at"], "2026-03-01 10:00:00")
+            store.save_quick_job_command(
+                quick_id, "sbatch /tmp/vllm.slurm", "/tmp", "captured", False,
+                "partial", "/tmp/snapshot.slurm", "Terminal",
+            )
+            store.save_quick_job_command(
+                quick_id, "sbatch --nodes=2 /tmp/vllm.slurm", "/tmp", "user", True,
+                "validated", "/tmp/snapshot.slurm", "Terminal",
+            )
+            saved_quick = store.quick_job(quick_id)
+            self.assertEqual(saved_quick["submit_method"], "Terminal")
+            self.assertEqual(saved_quick["command_user_edited"], 1)
+            self.assertEqual(len(store.quick_job_command_history(quick_id)), 1)
             store.delete_quick_job(quick_id)
             self.assertEqual(store.quick_jobs(), [])
 
