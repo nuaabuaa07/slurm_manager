@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -154,57 +154,44 @@ def split_values(text: str) -> List[str]:
     return [item.strip() for item in text.replace("\n", ",").split(",") if item.strip()]
 
 
-def scroll_text(text: str, key: str, height: int = 420) -> None:
-    """Render a persistent tail-style log viewer with follow and collapse controls."""
-    expanded_key = "log_viewer_expanded_" + key
-    if expanded_key not in st.session_state:
-        st.session_state[expanded_key] = True
-    expanded = bool(st.session_state[expanded_key])
-    toggle_label = "收起日志" if expanded else "展开日志"
-    if st.button(toggle_label, key="toggle_log_viewer_" + key):
-        st.session_state[expanded_key] = not expanded
-        st.rerun()
-    if not expanded:
-        st.caption("日志文本框已收起；自动刷新不会改变收起状态。")
-        return
-
+def scroll_text(text: str, key: str, follow_bottom: bool = True, height: int = 420) -> None:
+    """Render a tail-style log viewer and preserve position when follow is disabled."""
     storage_key = json.dumps("slurm-manager-log-" + key, ensure_ascii=False)
+    follow_value = "true" if follow_bottom else "false"
     document = (
         "<!doctype html><html><head><style>"
         "html,body{margin:0;padding:0;background:#f6f8fa;color:#24292f;overflow:hidden;}"
-        ".toolbar{box-sizing:border-box;height:38px;display:flex;align-items:center;gap:8px;"
-        "padding:5px 8px;border:1px solid #dfe2e5;border-bottom:0;border-radius:6px 6px 0 0;"
-        "background:#eef1f4;font:12px sans-serif;}"
-        "button{border:1px solid #b8bec7;background:white;border-radius:5px;padding:4px 9px;cursor:pointer;}"
-        "button:hover{background:#f6f8fa}.status{margin-left:auto;color:#57606a;}"
-        "pre{box-sizing:border-box;margin:0;width:100%;height:calc(100vh - 38px);overflow:auto;"
+        "pre{box-sizing:border-box;margin:0;width:100%;height:100vh;overflow:auto;"
         "white-space:pre-wrap;word-break:break-word;border:1px solid #dfe2e5;"
-        "border-radius:0 0 6px 6px;padding:12px;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;}"
-        "</style></head><body>"
-        "<div class='toolbar'><button id='follow'></button><button id='bottom'>回到底部</button>"
-        "<span id='status' class='status'></span></div>"
-        "<pre id='log'>" + html.escape(text) + "</pre>"
+        "border-radius:6px;padding:12px;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;}"
+        "</style></head><body><pre id='log'>" + html.escape(text) + "</pre>"
         "<script>"
         "const base=" + storage_key + ";const log=document.getElementById('log');"
-        "const followButton=document.getElementById('follow');const status=document.getElementById('status');"
-        "let follow=true;let restoring=true;"
-        "try{const saved=sessionStorage.getItem(base+'-follow');if(saved!==null)follow=saved==='1';}catch(e){}"
+        "const follow=" + follow_value + ";let restoring=true;"
         "function save(name,value){try{sessionStorage.setItem(base+'-'+name,String(value));}catch(e){}}"
-        "function render(){followButton.textContent=follow?'暂停跟随':'继续跟随';"
-        "status.textContent=follow?'正在跟随日志尾部':'已暂停跟随';}"
         "function toBottom(){restoring=true;log.scrollTop=log.scrollHeight;requestAnimationFrame(()=>{restoring=false;});}"
         "requestAnimationFrame(()=>{if(follow){toBottom();}else{"
         "let position=0;try{position=Number(sessionStorage.getItem(base+'-scroll')||0);}catch(e){}"
-        "log.scrollTop=position;restoring=false;}render();});"
-        "log.addEventListener('scroll',()=>{if(restoring)return;"
-        "const atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<16;"
-        "if(follow&&!atBottom){follow=false;save('follow',0);render();}"
-        "if(!follow)save('scroll',log.scrollTop);});"
-        "followButton.onclick=()=>{follow=!follow;save('follow',follow?1:0);if(follow)toBottom();render();};"
-        "document.getElementById('bottom').onclick=()=>{follow=true;save('follow',1);toBottom();render();};"
+        "log.scrollTop=position;restoring=false;}});"
+        "log.addEventListener('scroll',()=>{if(!restoring&&!follow)save('scroll',log.scrollTop);});"
         "</script></body></html>"
     )
     components.html(document, height=height, scrolling=False)
+
+
+def log_tail_controls(key: str, interval_ms: int = 5000) -> bool:
+    """Render the two common stateful switches and return follow-bottom state."""
+    refresh_column, follow_column = st.columns(2)
+    auto = refresh_column.toggle(
+        f"自动刷新（{interval_ms // 1000} 秒）", value=True, key="log_auto_refresh_" + key
+    )
+    follow = follow_column.toggle("跟随底部", value=True, key="log_follow_bottom_" + key)
+    if auto:
+        if st_autorefresh:
+            st_autorefresh(interval=interval_ms, key="log_refresh_timer_" + key)
+        else:
+            st.warning("当前环境未安装 streamlit-autorefresh，无法自动刷新日志。")
+    return bool(follow)
 
 
 def parse_exports(text: str) -> Dict[str, str]:
@@ -495,6 +482,9 @@ def submit_payload(payload: Mapping[str, Any], action: str = "SBATCH") -> Option
                 except Exception as exc:
                     STORE.record_action("WEBUI_SUBMIT_RECORD", job_id, "FAILED", str(exc))
                     st.warning("作业已经提交成功，但保存重启命令失败：" + str(exc))
+                waiting = dict(st.session_state.get("quick_job_waiting", {}))
+                waiting[job_id] = time.time() + 30
+                st.session_state["quick_job_waiting"] = waiting
             st.success(f"提交成功，Job ID：{job_id}")
             return job_id
         error_from(result)
@@ -526,45 +516,197 @@ def confirm_action(token: str, label: str, confirm_label: str, action) -> None:
             st.rerun()
 
 
+def protected_quick_job_ids() -> set[str]:
+    return {
+        str(job_id)
+        for job_id, deadline in dict(st.session_state.get("quick_job_waiting", {})).items()
+        if time.time() < float(deadline)
+    }
+
+
+def stopped_quick_job_records(
+    records: Sequence[Mapping[str, Any]],
+    live_ids: set[str],
+    predicate: Optional[Callable[[Mapping[str, Any]], bool]] = None,
+) -> List[Mapping[str, Any]]:
+    protected = protected_quick_job_ids()
+    return [
+        record for record in records
+        if str(record.get("slurm_job_id", "")) not in live_ids | protected
+        and (predicate is None or predicate(record))
+    ]
+
+
+def is_vllm_quick_job(record: Mapping[str, Any]) -> bool:
+    payload = record.get("payload", {})
+    preset_kind = str(payload.get("_preset_kind", "")) if isinstance(payload, Mapping) else ""
+    values = (
+        str(record.get("job_type", "")), str(record.get("name", "")),
+        str(record.get("script_path", "")), preset_kind,
+    )
+    return any("vllm" in value.lower() for value in values)
+
+
+def delete_stopped_quick_job_records(
+    users: str,
+    predicate: Optional[Callable[[Mapping[str, Any]], bool]] = None,
+) -> int:
+    jobs, result = SLURM.jobs(users)
+    if not result.ok:
+        raise RuntimeError("无法确认实时 Slurm 作业状态，已取消清理：" + (result.stderr or "squeue failed"))
+    live_ids = {str(job["job_id"]) for job in jobs}
+    stopped = stopped_quick_job_records(STORE.quick_jobs(), live_ids, predicate)
+    return STORE.delete_quick_jobs([int(record["id"]) for record in stopped])
+
+
+def bulk_delete_stopped_control(
+    token: str,
+    count: int,
+    delete_action: Callable[[], int],
+    button_container: Any = None,
+) -> None:
+    notice_key = token + "_notice"
+    if st.session_state.get(notice_key):
+        st.success(str(st.session_state.pop(notice_key)))
+    target = button_container or st
+    if target.button(
+        "一键删除已停止项",
+        key="ask_" + token,
+        disabled=count <= 0,
+        help=f"当前可清理 {count} 项；只删除平台记录，不会停止任务。",
+    ):
+        st.session_state["pending_action"] = token
+        st.rerun()
+    if st.session_state.get("pending_action") == token:
+        st.warning(f"确认删除 {count} 条已停止的平台记录？该操作不会停止任何实际任务。")
+        yes, no = st.columns(2)
+        if yes.button("确认批量删除", type="primary", key="yes_" + token):
+            try:
+                deleted = delete_action()
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.session_state[notice_key] = f"已删除 {deleted} 条停止记录。"
+                st.session_state.pop("pending_action", None)
+                st.rerun()
+        if no.button("返回", key="no_" + token):
+            st.session_state.pop("pending_action", None)
+            st.rerun()
+
+
+def preset_node_values(kind: str, payload: Mapping[str, Any]) -> List[str]:
+    field = "nodes" if kind == "metrics" else "nodelist"
+    return split_values(str(payload.get(field, "")))
+
+
+def preset_node_count_text(kind: str, payload: Mapping[str, Any]) -> str:
+    if kind == "compute":
+        return "节点随所选作业"
+    nodes = preset_node_values(kind, payload)
+    configured_count = int(payload.get("nodes", 0) or 0) if kind != "metrics" else 0
+    return f"{configured_count or len(nodes)} 个节点"
+
+
+def preset_script_name(kind: str, payload: Mapping[str, Any]) -> str:
+    script_path = str(payload.get("script_path", "")).strip()
+    if script_path:
+        return Path(script_path).name
+    if kind == "compute":
+        try:
+            tokens = shlex.split(str(payload.get("command", "")))
+        except ValueError:
+            tokens = str(payload.get("command", "")).split()
+        candidate = next(
+            (token for token in tokens if Path(token).suffix.lower() in {".py", ".sh", ".bash"}),
+            "",
+        )
+        return Path(candidate).name if candidate else "命令任务"
+    return "采样组" if kind == "metrics" else "未指定脚本"
+
+
+def preset_summary(preset: Mapping[str, Any], kind: str) -> str:
+    payload = preset.get("payload", {})
+    updated_at = str(preset.get("updated_at", "")).replace("T", " ") or "—"
+    return (
+        f"**{preset.get('name', '')}**　·　脚本：`{preset_script_name(kind, payload)}`"
+        f"　·　{preset_node_count_text(kind, payload)}　·　更新：{updated_at}"
+    )
+
+
+def preset_details(kind: str, payload: Mapping[str, Any]) -> None:
+    if kind == "compute":
+        st.caption(
+            "任务名称：" + str(payload.get("task_name", "—"))
+            + "　·　类型：" + ("Ray 任务" if payload.get("task_type") == "ray" else "一般任务")
+        )
+        st.code(str(payload.get("command", "")), language="bash")
+        return
+
+    script_path = str(payload.get("script_path", "")).strip()
+    if script_path:
+        st.caption("脚本完整路径：" + script_path)
+    partition = str(payload.get("partition", "")).strip()
+    if partition:
+        st.caption("Partition：" + partition)
+    nodes = preset_node_values(kind, payload)
+    if nodes:
+        st.caption("节点列表（共 " + str(len(nodes)) + " 个）")
+        st.code(",".join(nodes), language="text")
+    if kind == "metrics":
+        method_labels = {"auto": "自动（exporter → srun）", "direct": "仅 exporter", "srun": "仅 srun"}
+        st.caption(
+            "采样方式：" + method_labels.get(str(payload.get("method", "auto")), str(payload.get("method", "auto")))
+            + "　·　单节点超时：" + str(payload.get("timeout", 20)) + " 秒"
+        )
+    if kind == "vllm":
+        st.caption(
+            "模型路径：" + (str(payload.get("model_path", "")).strip() or "使用脚本默认值")
+            + "　·　模型名称：" + (str(payload.get("model_name", "")).strip() or "使用脚本默认值")
+        )
+    exports = str(payload.get("exports", "")).strip()
+    if exports:
+        st.caption("环境变量")
+        st.code(exports, language="bash")
+
+
 def preset_cards(kind: str, action_label: str, on_run) -> None:
     presets = STORE.presets(kind)
     if not presets:
         st.caption("暂无预设，可在下方创建。")
         return
-    columns = st.columns(min(3, len(presets)))
-    for index, preset in enumerate(presets):
-        with columns[index % len(columns)].container(border=True):
-            st.markdown(f"**{preset['name']}**")
-            payload = preset["payload"]
-            st.caption(str(payload.get("summary") or payload.get("partition") or payload.get("script_path", "")))
-            if kind != "metrics" and payload.get("script_path"):
-                st.caption("脚本：" + Path(str(payload["script_path"])).name)
-            if kind == "vllm" and payload.get("model_name") and "$" not in str(payload["model_name"]):
-                st.caption("模型：" + str(payload["model_name"]))
-            node_text = payload.get("nodes", "") if kind == "metrics" else payload.get("nodelist", "")
-            if node_text:
-                st.caption("节点：" + ", ".join(split_values(str(node_text))))
-            run_col, del_col = st.columns(2)
-            if run_col.button(action_label, key=f"run_preset_{kind}_{preset['id']}", type="primary"):
-                run_payload = dict(payload)
-                run_payload["_preset_id"] = int(preset["id"])
-                run_payload["_preset_name"] = str(preset["name"])
-                run_payload["_preset_kind"] = kind
-                on_run(run_payload)
-            token = f"delete_preset_{kind}_{preset['id']}"
-            if del_col.button("删除", key="ask_" + token):
-                st.session_state["pending_action"] = token
+    for preset in presets:
+        payload = preset["payload"]
+        if kind == "vllm":
+            detail_col, run_col, delete_col = st.columns([8, 1.15, 1])
+            edit_col = None
+        else:
+            detail_col, run_col, edit_col, delete_col = st.columns([7, 1.15, 1, 1])
+        with detail_col.expander(preset_summary(preset, kind), expanded=False):
+            preset_details(kind, payload)
+        if run_col.button(action_label, key=f"run_preset_{kind}_{preset['id']}", type="primary", use_container_width=True):
+            run_payload = dict(payload)
+            run_payload["_preset_id"] = int(preset["id"])
+            run_payload["_preset_name"] = str(preset["name"])
+            run_payload["_preset_kind"] = kind
+            on_run(run_payload)
+        if edit_col is not None and edit_col.button("修改", key=f"edit_preset_{kind}_{preset['id']}", use_container_width=True):
+            editor_key = "metrics_choice" if kind == "metrics" else f"preset_choice_{kind}"
+            st.session_state[editor_key] = str(preset["name"])
+            st.rerun()
+        token = f"delete_preset_{kind}_{preset['id']}"
+        if delete_col.button("删除", key="ask_" + token, use_container_width=True):
+            st.session_state["pending_action"] = token
+            st.rerun()
+        if st.session_state.get("pending_action") == token:
+            st.warning(f"确认删除预设“{preset['name']}”？")
+            y, n, _ = st.columns([1, 1, 7])
+            if y.button("确认删除", key="yes_" + token):
+                STORE.delete_preset(int(preset["id"]))
+                st.session_state.pop("pending_action", None)
                 st.rerun()
-            if st.session_state.get("pending_action") == token:
-                st.warning("确认删除这个预设？")
-                y, n = st.columns(2)
-                if y.button("确认删除", key="yes_" + token):
-                    STORE.delete_preset(int(preset["id"]))
-                    st.session_state.pop("pending_action", None)
-                    st.rerun()
-                if n.button("返回", key="no_" + token):
-                    st.session_state.pop("pending_action", None)
-                    st.rerun()
+            if n.button("返回", key="no_" + token):
+                st.session_state.pop("pending_action", None)
+                st.rerun()
 
 
 def partition_options(preferred: str = "") -> List[str]:
@@ -1098,11 +1240,18 @@ def show_submission_command_editor(record: Mapping[str, Any]) -> None:
 
 
 def render_quick_job_manager() -> None:
-    title_col, refresh_col = st.columns([6, 1])
+    title_col, refresh_col, delete_col = st.columns([5, 1, 1.7])
     title_col.subheader("快捷作业列表")
     if refresh_col.button("刷新列表", key="quick_job_refresh"):
         st.rerun()
     records, live_ids = sync_quick_jobs()
+    stopped_records = stopped_quick_job_records(records, live_ids)
+    bulk_delete_stopped_control(
+        "bulk_delete_quick_jobs",
+        len(stopped_records),
+        lambda: delete_stopped_quick_job_records(str(CONFIG.get("default_user", ""))),
+        delete_col,
+    )
     if not records:
         st.caption("暂无 Slurm 作业记录。")
         return
@@ -1451,6 +1600,34 @@ def cancel_job(job_id: str) -> bool:
     return result.ok
 
 
+def job_state_badge(state: str) -> str:
+    normalized = state.strip().upper() or "UNKNOWN"
+    terminal = {
+        "BOOT_FAIL", "CANCELLED", "COMPLETED", "COMPLETING", "DEADLINE", "FAILED",
+        "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "REVOKED", "SPECIAL_EXIT",
+        "STAGE_OUT", "STOPPED", "TIMEOUT",
+    }
+    if normalized == "RUNNING":
+        foreground, background, border = "#166534", "#dcfce7", "#86efac"
+    elif normalized in terminal:
+        foreground, background, border = "#991b1b", "#fee2e2", "#fca5a5"
+    else:
+        foreground, background, border = "#92400e", "#fef3c7", "#fcd34d"
+    return (
+        f'<span style="display:inline-block;margin-left:.45rem;padding:.12rem .48rem;'
+        f'border:1px solid {border};border-radius:999px;background:{background};'
+        f'color:{foreground};font-size:.75rem;font-weight:700;vertical-align:middle">'
+        f'{html.escape(normalized)}</span>'
+    )
+
+
+def job_is_cancellable(state: str) -> bool:
+    return state.strip().upper() in {
+        "CONFIGURING", "PENDING", "REQUEUE_FED", "REQUEUE_HOLD", "REQUEUED",
+        "RESV_DEL_HOLD", "RUNNING", "SIGNALING", "SUSPENDED",
+    }
+
+
 def render_slurm_detail_and_logs(job: Mapping[str, str], prefix: str, show_detail: bool = True) -> None:
     detail, result = SLURM.job_detail(job["job_id"])
     if not result.ok:
@@ -1463,7 +1640,11 @@ def render_slurm_detail_and_logs(job: Mapping[str, str], prefix: str, show_detai
         pattern = detail.get(detail_key, "")
         tail_token = f"{prefix}_{job['job_id']}_{detail_key}"
         if column.button(label, key="show_" + tail_token, disabled=not pattern):
-            st.session_state["slurm_tail_target"] = tail_token
+            if st.session_state.get("slurm_tail_target") == tail_token:
+                st.session_state.pop("slurm_tail_target", None)
+            else:
+                st.session_state["slurm_tail_target"] = tail_token
+            st.rerun()
         if st.session_state.get("slurm_tail_target") == tail_token and pattern:
             path = expand_slurm_log_pattern(pattern, job["job_id"])
             if not Path(path).is_absolute() and detail.get("WorkDir"):
@@ -1471,7 +1652,8 @@ def render_slurm_detail_and_logs(job: Mapping[str, str], prefix: str, show_detai
             column.caption(path)
             try:
                 with column:
-                    scroll_text(tail_text(Path(path), 300), tail_token)
+                    follow_bottom = log_tail_controls(tail_token)
+                    scroll_text(tail_text(Path(path), 300), tail_token, follow_bottom)
             except OSError as exc:
                 column.warning(str(exc))
 
@@ -1482,10 +1664,12 @@ def job_card(
     node_connect_record: Optional[Mapping[str, Any]] = None,
 ) -> None:
     with st.container(border=True):
-        st.markdown(f"**{job['job_id']} · {job['name']}**")
+        state = str(job.get("state", "UNKNOWN"))
+        title = html.escape(f"{job['job_id']} · {job['name']}")
+        st.markdown(f"<strong>{title}</strong>{job_state_badge(state)}", unsafe_allow_html=True)
         if preset_name:
             st.caption("提交预设：" + preset_name)
-        st.caption(f"{job['user']} · {job['partition']} · {job['state']} · {job['elapsed']}/{job['limit']} · {job['nodes']} nodes")
+        st.caption(f"{job['user']} · {job['partition']} · {job['elapsed']}/{job['limit']} · {job['nodes']} nodes")
         st.caption("使用节点/排队原因：" + str(job.get("reason_or_nodes", "-")))
         if node_connect_record is not None:
             st.caption("节点连接")
@@ -1494,8 +1678,8 @@ def job_card(
             render_slurm_detail_and_logs(job, prefix)
         elif show_logs:
             render_slurm_detail_and_logs(job, prefix, show_detail=False)
-        if allow_cancel:
-            token = f"cancel_{prefix}_{job['job_id']}"
+        token = f"cancel_{prefix}_{job['job_id']}"
+        if allow_cancel and job_is_cancellable(state):
             if st.button("取消作业", key="ask_" + token):
                 st.session_state["pending_action"] = token
                 st.rerun()
@@ -1511,6 +1695,8 @@ def job_card(
                     st.rerun()
                 if n.button("返回", key="no_" + token):
                     st.session_state.pop("pending_action", None); st.rerun()
+        elif st.session_state.get("pending_action") == token:
+            st.session_state.pop("pending_action", None)
 
 
 def submitted_preset_name(
@@ -1546,12 +1732,74 @@ def job_connection_record(
     return record
 
 
+def job_row_label(job: Mapping[str, str]) -> str:
+    return f"{job['job_id']} · {job['name']} · {job['nodes']} 节点"
+
+
+def render_managed_job_row(
+    job: Mapping[str, str], prefix: str, preset_name: str,
+    stored: Mapping[str, Any],
+) -> None:
+    job_id = str(job["job_id"])
+    state = str(job.get("state", "UNKNOWN"))
+    detail_col, state_col, connect_col, cancel_col = st.columns([6, 1.4, 2, 1.5], vertical_alignment="top")
+    with detail_col.expander(job_row_label(job), expanded=False):
+        st.caption(
+            f"用户：{job['user']}　·　Partition：{job['partition']}"
+            f"　·　运行：{job['elapsed']}/{job['limit']}"
+        )
+        st.caption("使用节点/排队原因：" + str(job.get("reason_or_nodes", "-")))
+        if preset_name:
+            st.caption("提交预设：" + preset_name)
+        render_slurm_detail_and_logs(job, prefix)
+    state_col.markdown(job_state_badge(state), unsafe_allow_html=True)
+    with connect_col:
+        render_node_connect_control(job_connection_record(job, stored), state.upper() == "RUNNING")
+    token = f"cancel_{prefix}_{job_id}"
+    if job_is_cancellable(state) and cancel_col.button("取消作业", key="ask_" + token):
+        st.session_state["pending_action"] = token
+        st.rerun()
+    if st.session_state.get("pending_action") == token:
+        if not job_is_cancellable(state):
+            st.session_state.pop("pending_action", None)
+        else:
+            st.warning(f"确认取消作业 {job_id} 并释放资源？")
+            yes, no, _ = st.columns([1.2, 1, 7])
+            if yes.button("确认取消", type="primary", key="yes_" + token):
+                if cancel_job(job_id):
+                    cancelling = dict(st.session_state.get("cancelling_jobs", {}))
+                    cancelling[job_id] = time.time() + 20
+                    st.session_state["cancelling_jobs"] = cancelling
+                st.session_state.pop("pending_action", None)
+                st.rerun()
+            if no.button("返回", key="no_" + token):
+                st.session_state.pop("pending_action", None)
+                st.rerun()
+
+
 def render_job_management() -> None:
-    st.subheader("作业管理")
+    title_column, refresh_column, delete_column = st.columns([5, 1, 1.7])
+    title_column.subheader("作业管理")
+    if refresh_column.button("立即刷新", key="job_management_manual_refresh"):
+        st.rerun()
+    if st_autorefresh:
+        st_autorefresh(interval=5000, key="job_management_status_refresh")
+        st.caption("作业状态每 5 秒自动更新。")
+    else:
+        st.warning("当前环境未安装 streamlit-autorefresh，请使用“立即刷新”更新作业状态。")
     users = users_value()
     user_list = split_values(users)
     jobs = active_jobs(users)
-    stored_jobs = {str(item["slurm_job_id"]): item for item in STORE.quick_jobs()}
+    stored_records = STORE.quick_jobs()
+    stored_jobs = {str(item["slurm_job_id"]): item for item in stored_records}
+    live_ids = {str(job["job_id"]) for job in jobs}
+    stopped_records = stopped_quick_job_records(stored_records, live_ids)
+    bulk_delete_stopped_control(
+        "bulk_delete_managed_slurm_jobs",
+        len(stopped_records),
+        lambda: delete_stopped_quick_job_records(users),
+        delete_column,
+    )
     slurm_presets = STORE.presets("slurm")
     columns = st.columns(max(1, len(user_list)))
     for index, user in enumerate(user_list):
@@ -1564,12 +1812,7 @@ def render_job_management() -> None:
                 stored = stored_jobs.get(str(job["job_id"]), {})
                 payload = stored.get("payload", {}) if isinstance(stored, dict) else {}
                 preset_name = submitted_preset_name(payload, slurm_presets) if isinstance(payload, dict) else ""
-                job_card(
-                    job,
-                    user,
-                    preset_name=preset_name,
-                    node_connect_record=job_connection_record(job, stored),
-                )
+                render_managed_job_row(job, user, preset_name, stored)
     live_ids = {job["job_id"] for job in jobs}
     cancelling = dict(st.session_state.get("cancelling_jobs", {}))
     waiting = [job_id for job_id, deadline in cancelling.items() if job_id in live_ids and time.time() < float(deadline)]
@@ -1601,28 +1844,53 @@ def select_slurm_job_cards(jobs: Sequence[Mapping[str, str]], key: str, allow_ca
     if not jobs:
         st.warning("没有活动 Slurm 作业。")
         return None
-    columns = st.columns(min(4, len(jobs)))
     state_key = "selected_job_" + key
-    for index, job in enumerate(jobs):
-        with columns[index % len(columns)].container(border=True):
-            selected = st.session_state.get(state_key) == job["job_id"]
-            st.markdown(("✅ " if selected else "") + f"**{job['job_id']} · {job['name']}**")
-            st.caption(f"{job['user']} · {job['partition']} · {job['reason_or_nodes']}")
-            controls = st.columns(2) if allow_cancel else [st]
-            if controls[0].button("已选择" if selected else "选择", key=f"select_{key}_{job['job_id']}", disabled=selected):
-                st.session_state[state_key] = job["job_id"]
+    visible_ids = {str(job["job_id"]) for job in jobs}
+    if st.session_state.get(state_key) not in visible_ids:
+        st.session_state.pop(state_key, None)
+    stored_jobs = {str(item["slurm_job_id"]): item for item in STORE.quick_jobs()}
+    for job in jobs:
+        job_id = str(job["job_id"])
+        state = str(job.get("state", "UNKNOWN"))
+        selected = st.session_state.get(state_key) == job_id
+        widths = [5.5, 1.35, 2, 1.2, 1.5] if allow_cancel else [6, 1.4, 2, 1.4]
+        columns = st.columns(widths, vertical_alignment="top")
+        with columns[0].expander(("✓ " if selected else "") + job_row_label(job), expanded=False):
+            st.caption(
+                f"用户：{job['user']}　·　Partition：{job['partition']}"
+                f"　·　运行：{job['elapsed']}/{job['limit']}"
+            )
+            st.caption("使用节点/排队原因：" + str(job.get("reason_or_nodes", "-")))
+            if key == "vllm_endpoint" and selected:
+                st.caption("Slurm 日志")
+                render_slurm_detail_and_logs(job, "vllm", show_detail=False)
+        columns[1].markdown(job_state_badge(state), unsafe_allow_html=True)
+        with columns[2]:
+            render_node_connect_control(
+                job_connection_record(job, stored_jobs.get(job_id, {})),
+                state.upper() == "RUNNING",
+            )
+        if columns[3].button(
+            "已选择" if selected else "选择", key=f"select_{key}_{job_id}",
+            disabled=selected, use_container_width=True,
+        ):
+            st.session_state[state_key] = job_id
+            st.rerun()
+        if allow_cancel:
+            token = f"cancel_select_{key}_{job_id}"
+            if job_is_cancellable(state) and columns[4].button("取消作业", key="ask_" + token, use_container_width=True):
+                st.session_state["pending_action"] = token
                 st.rerun()
-            if allow_cancel:
-                token = f"cancel_select_{key}_{job['job_id']}"
-                if controls[1].button("取消作业", key="ask_" + token):
-                    st.session_state["pending_action"] = token; st.rerun()
-                if st.session_state.get("pending_action") == token:
-                    st.warning("确认取消这个 Slurm 作业并释放资源？")
-                    yes, no = st.columns(2)
-                    if yes.button("确认取消", type="primary", key="yes_" + token):
-                        cancel_job(job["job_id"]); st.session_state.pop("pending_action", None); st.rerun()
-                    if no.button("返回", key="no_" + token):
-                        st.session_state.pop("pending_action", None); st.rerun()
+            if st.session_state.get("pending_action") == token:
+                st.warning(f"确认取消作业 {job_id} 并释放资源？")
+                yes, no, _ = st.columns([1.2, 1, 7])
+                if yes.button("确认取消", type="primary", key="yes_" + token):
+                    cancel_job(job_id)
+                    st.session_state.pop("pending_action", None)
+                    st.rerun()
+                if no.button("返回", key="no_" + token):
+                    st.session_state.pop("pending_action", None)
+                    st.rerun()
     return st.session_state.get(state_key)
 
 
@@ -1633,6 +1901,15 @@ def refresh_compute_tasks(tasks: Sequence[Mapping[str, Any]]) -> None:
         except Exception:
             status = "UNREACHABLE"
         STORE.update_compute_task(int(task["id"]), status)
+
+
+def stopped_compute_tasks(tasks: Sequence[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    return [task for task in tasks if str(task.get("status", "")).upper() in {"STOPPED", "EXITED"}]
+
+
+def delete_stopped_compute_task_records() -> int:
+    stopped = stopped_compute_tasks(STORE.compute_tasks())
+    return STORE.delete_compute_tasks([int(task["id"]) for task in stopped])
 
 
 def stop_compute_task(task: Mapping[str, Any]) -> None:
@@ -1684,13 +1961,12 @@ def task_resources(task_id: int) -> None:
         for tab, resource in zip(tabs, resources):
             with tab:
                 if resource["kind"] == "log":
+                    lines = st.number_input("末尾行数", 20, 5000, 300, key=f"log_lines_{resource['id']}")
+                    viewer_key = f"task_{task_id}_resource_{resource['id']}"
+                    follow_bottom = log_tail_controls(viewer_key)
                     try:
                         path = resolve_allowed(resource["path"], CONFIG.paths("browse_roots"), must_exist=True)
-                        lines = st.number_input("末尾行数", 20, 5000, 300, key=f"log_lines_{resource['id']}")
-                        auto = st.toggle("每 5 秒刷新", key=f"log_auto_{resource['id']}")
-                        if auto and st_autorefresh:
-                            st_autorefresh(interval=5000, key=f"refresh_{resource['id']}")
-                        scroll_text(tail_text(path, int(lines)), f"task_{task_id}_resource_{resource['id']}")
+                        scroll_text(tail_text(path, int(lines)), viewer_key, follow_bottom)
                     except Exception as exc:
                         st.info("等待日志文件：" + str(exc))
                 else:
@@ -1727,27 +2003,34 @@ def compute_preset_cards(selected_job: str, node: str, address: str, port: int) 
     if not presets:
         st.caption("暂无计算节点任务预设，可在下方创建。")
         return
-    columns = st.columns(min(3, len(presets)))
-    for index, preset in enumerate(presets):
-        with columns[index % len(columns)].container(border=True):
-            payload = preset["payload"]
-            st.markdown(f"**{preset['name']}**")
-            st.caption("Ray 任务" if payload.get("task_type") == "ray" else "一般任务")
-            st.code(str(payload.get("command", "")), language="bash")
-            c1, c2 = st.columns(2)
-            if c1.button("一键提交", type="primary", key=f"run_compute_preset_{preset['id']}", disabled=not (selected_job and node)):
-                if submit_compute_payload(payload, selected_job, node, address, port):
-                    st.rerun()
-            token = f"delete_compute_preset_{preset['id']}"
-            if c2.button("删除", key="ask_" + token):
-                st.session_state["pending_action"] = token; st.rerun()
-            if st.session_state.get("pending_action") == token:
-                st.warning("确认删除这个任务预设？")
-                yes, no = st.columns(2)
-                if yes.button("确认删除", key="yes_" + token):
-                    STORE.delete_preset(int(preset["id"])); st.session_state.pop("pending_action", None); st.rerun()
-                if no.button("返回", key="no_" + token):
-                    st.session_state.pop("pending_action", None); st.rerun()
+    for preset in presets:
+        payload = preset["payload"]
+        detail_col, run_col, edit_col, delete_col = st.columns([7, 1.15, 1, 1])
+        with detail_col.expander(preset_summary(preset, "compute"), expanded=False):
+            preset_details("compute", payload)
+        if run_col.button(
+            "一键提交", type="primary", key=f"run_compute_preset_{preset['id']}",
+            disabled=not (selected_job and node), use_container_width=True,
+        ):
+            if submit_compute_payload(payload, selected_job, node, address, port):
+                st.rerun()
+        if edit_col.button("修改", key=f"edit_compute_preset_{preset['id']}", use_container_width=True):
+            st.session_state["compute_preset_choice"] = str(preset["name"])
+            st.rerun()
+        token = f"delete_compute_preset_{preset['id']}"
+        if delete_col.button("删除", key="ask_" + token, use_container_width=True):
+            st.session_state["pending_action"] = token
+            st.rerun()
+        if st.session_state.get("pending_action") == token:
+            st.warning(f"确认删除任务预设“{preset['name']}”？")
+            yes, no, _ = st.columns([1, 1, 7])
+            if yes.button("确认删除", key="yes_" + token):
+                STORE.delete_preset(int(preset["id"]))
+                st.session_state.pop("pending_action", None)
+                st.rerun()
+            if no.button("返回", key="no_" + token):
+                st.session_state.pop("pending_action", None)
+                st.rerun()
 
 
 def compute_preset_editor() -> None:
@@ -1798,12 +2081,11 @@ def independent_log_tracking() -> None:
         for tab, item in zip(tabs, logs):
             with tab:
                 lines = st.number_input("末尾行数", 20, 5000, 300, key=f"independent_lines_{item['id']}")
-                auto = st.toggle("每 5 秒刷新", key=f"independent_auto_{item['id']}")
-                if auto and st_autorefresh:
-                    st_autorefresh(interval=5000, key=f"independent_refresh_{item['id']}")
+                viewer_key = f"independent_{item['id']}"
+                follow_bottom = log_tail_controls(viewer_key)
                 try:
                     path = resolve_allowed(item["path"], CONFIG.paths("browse_roots"), must_exist=True)
-                    scroll_text(tail_text(path, int(lines)), f"independent_{item['id']}")
+                    scroll_text(tail_text(path, int(lines)), viewer_key, follow_bottom)
                 except Exception as exc:
                     st.info("等待日志文件：" + str(exc))
 
@@ -1854,10 +2136,19 @@ def page_compute_tasks() -> None:
                 if submit_compute_payload(payload, selected_job, node, address, port):
                     st.rerun()
 
-    st.divider(); st.subheader("已管理的计算节点任务")
+    st.divider()
+    task_title, refresh_column, delete_column = st.columns([5, 1.4, 1.7])
+    task_title.subheader("已管理的计算节点任务")
     tasks = STORE.compute_tasks()
-    if st.button("刷新全部 PID 状态", disabled=not tasks):
+    if refresh_column.button("刷新全部 PID 状态", disabled=not tasks):
         refresh_compute_tasks(tasks); st.rerun()
+    stopped_tasks = stopped_compute_tasks(tasks)
+    bulk_delete_stopped_control(
+        "bulk_delete_compute_tasks",
+        len(stopped_tasks),
+        delete_stopped_compute_task_records,
+        delete_column,
+    )
     for task in tasks:
         with st.container(border=True):
             c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 2])
@@ -1869,7 +2160,10 @@ def page_compute_tasks() -> None:
             st.code(task["command"], language="bash")
             token = f"stop_compute_{task['id']}"
             b1, b2, _ = st.columns([1, 1, 5])
-            if b1.button("停止任务", key="ask_" + token, disabled=task["status"] == "STOPPED"):
+            if b1.button(
+                "停止任务", key="ask_" + token,
+                disabled=str(task["status"]).upper() in {"STOPPED", "EXITED"},
+            ):
                 st.session_state["pending_action"] = token; st.rerun()
             if b2.button("删除记录", key=f"delete_compute_{task['id']}"):
                 st.session_state["pending_action"] = "delete_compute_" + str(task["id"]); st.rerun()
@@ -1908,8 +2202,20 @@ def page_vllm() -> None:
     slurm_preset_editor("vllm", scripts, "新增或修改 vLLM 预设")
     with st.expander("自定义提交 vLLM 脚本"):
         custom_submit_form(scripts, "vllm_custom")
-    st.divider(); st.subheader("Endpoint")
-    all_jobs = active_jobs(str(CONFIG.get("default_user", "")))
+    st.divider()
+    endpoint_title, delete_column = st.columns([6, 1.7])
+    endpoint_title.subheader("Endpoint")
+    vllm_users = str(CONFIG.get("default_user", ""))
+    all_jobs = active_jobs(vllm_users)
+    live_ids = {str(job["job_id"]) for job in all_jobs}
+    vllm_records = [record for record in STORE.quick_jobs() if is_vllm_quick_job(record)]
+    stopped_vllm_records = stopped_quick_job_records(vllm_records, live_ids, is_vllm_quick_job)
+    bulk_delete_stopped_control(
+        "bulk_delete_vllm_jobs",
+        len(stopped_vllm_records),
+        lambda: delete_stopped_quick_job_records(vllm_users, is_vllm_quick_job),
+        delete_column,
+    )
     waiting_job_id = str(st.session_state.get("vllm_wait_job", ""))
     recent_job_id = str(st.session_state.get("vllm_recent_job", ""))
     waiting_job = next((job for job in all_jobs if job["job_id"] == waiting_job_id), None)
@@ -1946,10 +2252,6 @@ def page_vllm() -> None:
                 inferred_script = matched.path
             except OSError:
                 pass
-        selected_job_row = next((item for item in jobs if item["job_id"] == selected_job), None)
-        if selected_job_row:
-            st.caption("Slurm 日志")
-            render_slurm_detail_and_logs(selected_job_row, "vllm", show_detail=False)
     endpoint_key = selected_job or "manual"
     addresses_text = st.text_area("节点 IP / hostname", value="\n".join(addresses), key="vllm_addresses_" + endpoint_key)
     ports_text = st.text_input("端口", value=inferred.get("ports") or str(CONFIG.get("vllm_default_ports", "8000-8007")), key="vllm_ports_" + endpoint_key)
@@ -2099,7 +2401,7 @@ PAGES = {
 }
 
 with st.sidebar:
-    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.5")
+    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.10")
     page = st.radio("导航", list(PAGES), label_visibility="collapsed")
     st.divider(); health = SLURM.health(); st.metric("Slurm CLI", f"{sum(bool(x['available']) for x in health)}/{len(health)}")
     st.caption(f"用户：{CONFIG.get('default_user', '')}")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
 class StateStore:
@@ -279,6 +279,16 @@ class StateStore:
             db.execute("DELETE FROM task_resources WHERE task_id=?", (task_id,))
             db.execute("DELETE FROM compute_tasks WHERE id=?", (task_id,))
 
+    def delete_compute_tasks(self, task_ids: Sequence[int]) -> int:
+        ids = list(dict.fromkeys(int(task_id) for task_id in task_ids))
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as db:
+            db.execute(f"DELETE FROM task_resources WHERE task_id IN ({placeholders})", ids)
+            cursor = db.execute(f"DELETE FROM compute_tasks WHERE id IN ({placeholders})", ids)
+            return int(cursor.rowcount)
+
     def task_resources(self, task_id: int) -> List[Dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute(
@@ -434,3 +444,15 @@ class StateStore:
         with self._connect() as db:
             db.execute("DELETE FROM quick_job_command_history WHERE quick_job_id=?", (record_id,))
             db.execute("DELETE FROM quick_jobs WHERE id=?", (record_id,))
+
+    def delete_quick_jobs(self, record_ids: Sequence[int]) -> int:
+        ids = list(dict.fromkeys(int(record_id) for record_id in record_ids))
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as db:
+            db.execute(
+                f"DELETE FROM quick_job_command_history WHERE quick_job_id IN ({placeholders})", ids
+            )
+            cursor = db.execute(f"DELETE FROM quick_jobs WHERE id IN ({placeholders})", ids)
+            return int(cursor.rowcount)

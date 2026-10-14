@@ -261,8 +261,11 @@ class UtilityTests(unittest.TestCase):
             self.assertEqual(saved_quick["submit_method"], "Terminal")
             self.assertEqual(saved_quick["command_user_edited"], 1)
             self.assertEqual(len(store.quick_job_command_history(quick_id)), 1)
-            store.delete_quick_job(quick_id)
+            self.assertEqual(store.delete_quick_jobs([quick_id]), 1)
             self.assertEqual(store.quick_jobs(), [])
+            stopped_one = store.add_compute_task("stopped-1", "normal", "42", "n1", 0, "x", "1", "STOPPED")
+            stopped_two = store.add_compute_task("stopped-2", "normal", "42", "n1", 0, "x", "2", "EXITED")
+            self.assertEqual(store.delete_compute_tasks([stopped_one, stopped_two]), 2)
 
 
 if __name__ == "__main__":
