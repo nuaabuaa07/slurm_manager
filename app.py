@@ -1090,7 +1090,9 @@ def restart_quick_job(record: Mapping[str, Any]) -> None:
     st.session_state["quick_job_waiting"] = waiting
 
 
-def render_node_connect_control(record: Mapping[str, Any], enabled: bool) -> None:
+def render_node_connect_control(
+    record: Mapping[str, Any], enabled: bool, port_override: int = 0
+) -> None:
     prefix = str(CONFIG.get("node_connect_command", "")).strip()
     payload = dict(record.get("payload", {}))
     address = str(payload.get("_master_address", "")).strip()
@@ -1098,7 +1100,7 @@ def render_node_connect_control(record: Mapping[str, Any], enabled: bool) -> Non
     if not (prefix and address and job_id):
         st.caption("尚无连接信息")
         return
-    port = shell_port(
+    port = port_override or shell_port(
         job_id,
         int(CONFIG.get("shell_port_base", 10000)),
         int(CONFIG.get("shell_port_modulo", 40000)),
@@ -1605,7 +1607,7 @@ def job_state_badge(state: str) -> str:
     terminal = {
         "BOOT_FAIL", "CANCELLED", "COMPLETED", "COMPLETING", "DEADLINE", "FAILED",
         "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "REVOKED", "SPECIAL_EXIT",
-        "STAGE_OUT", "STOPPED", "TIMEOUT",
+        "STAGE_OUT", "STOPPED", "EXITED", "TIMEOUT",
     }
     if normalized == "RUNNING":
         foreground, background, border = "#166534", "#dcfce7", "#86efac"
@@ -1940,35 +1942,43 @@ def result_view(path_text: str, key: str) -> None:
 
 def task_resources(task_id: int) -> None:
     resources = STORE.task_resources(task_id)
-    with st.expander("配置日志与结果跟踪", expanded=not resources):
-        for resource in resources:
-            c1, c2, c3, c4 = st.columns([1, 2, 5, 1])
-            c1.write(resource["kind"]); c2.write(resource["label"]); c3.code(resource["path"], language="text")
-            if c4.button("删除", key=f"delete_resource_{resource['id']}"):
-                STORE.delete_task_resource(int(resource["id"])); st.rerun()
-        c1, c2 = st.columns(2)
-        kind = c1.selectbox("类型", ["log", "result"], format_func=lambda value: "日志 Tail" if value == "log" else "结果 / JSONL", key=f"resource_kind_{task_id}")
-        label = c2.text_input("标签", key=f"resource_label_{task_id}")
-        path = st.text_input("绝对路径", key=f"resource_path_{task_id}")
-        if st.button("添加跟踪项", disabled=not (label and path), key=f"add_resource_{task_id}"):
-            try:
-                resolve_allowed(path, CONFIG.paths("browse_roots"), must_exist=False)
-                STORE.add_task_resource(task_id, kind, label, path); st.rerun()
-            except Exception as exc:
-                st.error(str(exc))
+    st.markdown("**日志与结果跟踪**")
+    for resource in resources:
+        c1, c2, c3, c4 = st.columns([1, 2, 5, 1])
+        c1.write(resource["kind"]); c2.write(resource["label"]); c3.code(resource["path"], language="text")
+        if c4.button("删除", key=f"delete_resource_{resource['id']}"):
+            STORE.delete_task_resource(int(resource["id"])); st.rerun()
+    c1, c2 = st.columns(2)
+    kind = c1.selectbox("类型", ["log", "result"], format_func=lambda value: "日志 Tail" if value == "log" else "结果 / JSONL", key=f"resource_kind_{task_id}")
+    label = c2.text_input("标签", key=f"resource_label_{task_id}")
+    path = st.text_input("绝对路径", key=f"resource_path_{task_id}")
+    if st.button("添加跟踪项", disabled=not (label and path), key=f"add_resource_{task_id}"):
+        try:
+            resolve_allowed(path, CONFIG.paths("browse_roots"), must_exist=False)
+            STORE.add_task_resource(task_id, kind, label, path); st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
     if resources:
         tabs = st.tabs([f"{'日志' if item['kind']=='log' else '结果'} · {item['label']}" for item in resources])
         for tab, resource in zip(tabs, resources):
             with tab:
                 if resource["kind"] == "log":
-                    lines = st.number_input("末尾行数", 20, 5000, 300, key=f"log_lines_{resource['id']}")
                     viewer_key = f"task_{task_id}_resource_{resource['id']}"
-                    follow_bottom = log_tail_controls(viewer_key)
-                    try:
-                        path = resolve_allowed(resource["path"], CONFIG.paths("browse_roots"), must_exist=True)
-                        scroll_text(tail_text(path, int(lines)), viewer_key, follow_bottom)
-                    except Exception as exc:
-                        st.info("等待日志文件：" + str(exc))
+                    open_key = viewer_key + "_open"
+                    if st.button(
+                        "Tail 日志", key="toggle_" + viewer_key,
+                        type="primary" if st.session_state.get(open_key, False) else "secondary",
+                        help="再次点击可收起日志窗口",
+                    ):
+                        st.session_state[open_key] = not st.session_state.get(open_key, False)
+                    if st.session_state.get(open_key, False):
+                        lines = st.number_input("末尾行数", 20, 5000, 300, key=f"log_lines_{resource['id']}")
+                        follow_bottom = log_tail_controls(viewer_key)
+                        try:
+                            path = resolve_allowed(resource["path"], CONFIG.paths("browse_roots"), must_exist=True)
+                            scroll_text(tail_text(path, int(lines)), viewer_key, follow_bottom)
+                        except Exception as exc:
+                            st.info("等待日志文件：" + str(exc))
                 else:
                     result_view(resource["path"], str(resource["id"]))
 
@@ -2090,6 +2100,70 @@ def independent_log_tracking() -> None:
                     st.info("等待日志文件：" + str(exc))
 
 
+def render_compute_task_row(task: Mapping[str, Any]) -> None:
+    task_id = int(task["id"])
+    status = str(task.get("status", "UNKNOWN")).upper()
+    detail_col, state_col, pid_col, connect_col, stop_col = st.columns(
+        [5, 1.4, 1.3, 2.2, 1.4], vertical_alignment="top"
+    )
+    with detail_col.expander(f"#{task_id} · {task['name']}", expanded=False):
+        task_type = "Ray 任务" if task["task_type"] == "ray" else "一般任务"
+        st.caption(
+            f"{task_type}　·　Slurm Job {task['slurm_job_id']}"
+            f"　·　计算节点 {task['host']}:{task['port']}"
+        )
+        st.caption("提交命令")
+        st.code(str(task["command"]), language="bash")
+        task_resources(task_id)
+        if st.button("删除记录", key=f"delete_compute_{task_id}"):
+            st.session_state["pending_action"] = f"delete_compute_{task_id}"
+            st.rerun()
+    state_col.markdown(job_state_badge(status), unsafe_allow_html=True)
+    pid_col.write(f"PID {task['pid']}")
+    with connect_col:
+        st.caption("复制 connect 登录命令")
+        render_node_connect_control(
+            {
+                "slurm_job_id": str(task["slurm_job_id"]),
+                "payload": {"_master_address": str(task["host"])},
+            },
+            enabled=True,
+            port_override=int(task.get("port") or 0),
+        )
+    stop_token = f"stop_compute_{task_id}"
+    if stop_col.button(
+        "停止任务", key="ask_" + stop_token,
+        disabled=status in {"STOPPED", "EXITED"}, use_container_width=True,
+    ):
+        st.session_state["pending_action"] = stop_token
+        st.rerun()
+    if st.session_state.get("pending_action") == stop_token:
+        st.warning(f"确认终止任务 #{task_id} 的整个进程组（包括子进程）？")
+        yes, no, _ = st.columns([1.2, 1, 7])
+        if yes.button("确认停止", type="primary", key="yes_" + stop_token):
+            try:
+                stop_compute_task(task)
+            except Exception as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.pop("pending_action", None)
+                st.rerun()
+        if no.button("返回", key="no_" + stop_token):
+            st.session_state.pop("pending_action", None)
+            st.rerun()
+    delete_token = f"delete_compute_{task_id}"
+    if st.session_state.get("pending_action") == delete_token:
+        st.warning(f"只删除任务 #{task_id} 的平台记录，不停止进程。确认？")
+        yes, no, _ = st.columns([1.2, 1, 7])
+        if yes.button("确认删除记录", key="yes_" + delete_token):
+            STORE.delete_compute_task(task_id)
+            st.session_state.pop("pending_action", None)
+            st.rerun()
+        if no.button("返回", key="no_" + delete_token):
+            st.session_state.pop("pending_action", None)
+            st.rerun()
+
+
 def page_compute_tasks() -> None:
     st.title("计算节点任务")
     users = users_value("compute_users")
@@ -2150,41 +2224,7 @@ def page_compute_tasks() -> None:
         delete_column,
     )
     for task in tasks:
-        with st.container(border=True):
-            c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 2])
-            c1.markdown(f"**#{task['id']} · {task['name']}**")
-            c2.write("Ray 任务" if task["task_type"] == "ray" else "一般任务")
-            c3.write(f"Job {task['slurm_job_id']}")
-            c4.write(f"PID {task['pid']}")
-            c5.write(task["status"])
-            st.code(task["command"], language="bash")
-            token = f"stop_compute_{task['id']}"
-            b1, b2, _ = st.columns([1, 1, 5])
-            if b1.button(
-                "停止任务", key="ask_" + token,
-                disabled=str(task["status"]).upper() in {"STOPPED", "EXITED"},
-            ):
-                st.session_state["pending_action"] = token; st.rerun()
-            if b2.button("删除记录", key=f"delete_compute_{task['id']}"):
-                st.session_state["pending_action"] = "delete_compute_" + str(task["id"]); st.rerun()
-            if st.session_state.get("pending_action") == token:
-                st.warning("确认终止整个任务进程组（包括子进程）？")
-                y, n = st.columns(2)
-                if y.button("确认停止", type="primary", key="yes_" + token):
-                    try: stop_compute_task(task)
-                    except Exception as exc: st.error(str(exc))
-                    st.session_state.pop("pending_action", None); st.rerun()
-                if n.button("返回", key="no_" + token):
-                    st.session_state.pop("pending_action", None); st.rerun()
-            delete_token = "delete_compute_" + str(task["id"])
-            if st.session_state.get("pending_action") == delete_token:
-                st.warning("只删除平台记录，不停止进程。确认？")
-                y, n = st.columns(2)
-                if y.button("确认删除记录", key="yes_" + delete_token):
-                    STORE.delete_compute_task(int(task["id"])); st.session_state.pop("pending_action", None); st.rerun()
-                if n.button("返回", key="no_" + delete_token):
-                    st.session_state.pop("pending_action", None); st.rerun()
-            task_resources(int(task["id"]))
+        render_compute_task_row(task)
     independent_log_tracking()
 
 
@@ -2401,7 +2441,7 @@ PAGES = {
 }
 
 with st.sidebar:
-    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.10")
+    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.12")
     page = st.radio("导航", list(PAGES), label_visibility="collapsed")
     st.divider(); health = SLURM.health(); st.metric("Slurm CLI", f"{sum(bool(x['available']) for x in health)}/{len(health)}")
     st.caption(f"用户：{CONFIG.get('default_user', '')}")
