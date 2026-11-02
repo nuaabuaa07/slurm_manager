@@ -31,6 +31,7 @@ DEFAULTS: Dict[str, Any] = {
         "/data/hpc/home/${USER}",
     ],
     "state_db": "${PROJECT_ROOT}/.slurm_manager/state.db",
+    "local_state_root": "/tmp",
     "job_snapshot_dir": "${PROJECT_ROOT}/.slurm_manager/job_snapshots",
     "command_timeout_seconds": 30,
     "metrics_timeout_seconds": 20,
@@ -69,12 +70,28 @@ class AppConfig:
 
 
 def load_config(path: str = "") -> AppConfig:
-    selected = Path(path or os.environ.get("SLURM_MANAGER_CONFIG", "") or PROJECT_ROOT / "config.json")
+    specified = path or os.environ.get("SLURM_MANAGER_CONFIG", "")
+    selected = Path(specified) if specified else PROJECT_ROOT / (
+        "config.yaml" if (PROJECT_ROOT / "config.yaml").exists() else "config.json"
+    )
     values = dict(DEFAULTS)
-    if selected.exists():
-        with selected.open("r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
-        if not isinstance(loaded, dict):
-            raise ValueError("config.json 顶层必须是 JSON object")
-        values.update(loaded)
+    sources = [selected]
+    # In the default setup, config.yaml can override only the desired keys
+    # while the existing config.json continues to supply all other settings.
+    if not specified and selected.suffix.lower() in {".yaml", ".yml"}:
+        sources.insert(0, PROJECT_ROOT / "config.json")
+    for source in sources:
+        if source.exists():
+            with source.open("r", encoding="utf-8") as handle:
+                if source.suffix.lower() in {".yaml", ".yml"}:
+                    try:
+                        import yaml
+                    except ImportError as exc:
+                        raise RuntimeError("YAML 配置需要安装 PyYAML：pip install -r requirements.txt") from exc
+                    loaded = yaml.safe_load(handle)
+                else:
+                    loaded = json.load(handle)
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{source.name} 顶层必须是对象映射")
+            values.update(loaded)
     return AppConfig(_expand(values), selected)

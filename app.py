@@ -25,10 +25,10 @@ from slurm_manager.auth import auth_cookie_name, make_auth_token, valid_auth_tok
 from slurm_manager.config import PROJECT_ROOT, load_config
 from slurm_manager.files import find_jsonl, list_directory, preview_jsonl, resolve_allowed
 from slurm_manager.metrics import MetricsService
+from slurm_manager.local_state import get_local_state_mirror
 from slurm_manager.ray import ShellGateway, extract_log_path, shell_port
 from slurm_manager.runner import CommandResult, CommandRunner
 from slurm_manager.slurm import SlurmService, SubmitRequest, expand_slurm_log_pattern, tail_text
-from slurm_manager.storage import StateStore
 from slurm_manager.vllm import (
     build_endpoints,
     check_endpoints,
@@ -68,11 +68,14 @@ def services():
         timeout=int(config.get("metrics_timeout_seconds", 20)),
         parallelism=int(config.get("metrics_parallelism", 8)),
     )
-    store = StateStore(Path(config.get("state_db")))
-    return config, runner, slurm, metrics, store, ShellGateway()
+    mirror = get_local_state_mirror(
+        Path(config.get("state_db")), Path(config.get("local_state_root", "/tmp")),
+        str(PROJECT_ROOT),
+    )
+    return config, runner, slurm, metrics, mirror.store, ShellGateway(), mirror
 
 
-CONFIG, RUNNER, SLURM, METRICS, STORE, GATEWAY = services()
+CONFIG, RUNNER, SLURM, METRICS, STORE, GATEWAY, STATE_MIRROR = services()
 
 
 def auth_query_token() -> str:
@@ -2420,6 +2423,10 @@ def page_keepalive() -> None:
 def page_history() -> None:
     st.title("历史与诊断")
     st.dataframe(SLURM.health(), use_container_width=True, hide_index=True)
+    st.caption(f"当前 SQLite：{STORE.path}　·　持久快照：{STATE_MIRROR.snapshot_path}（每 60 秒备份）")
+    st.caption(f"最近成功备份：{STATE_MIRROR.last_backup_at or '尚未完成'}")
+    if STATE_MIRROR.last_backup_error:
+        st.error("最近一次数据库备份失败：" + STATE_MIRROR.last_backup_error)
     if not os.environ.get("SLURM_MANAGER_PASSWORD"):
         st.warning("当前使用默认密码，建议设置 SLURM_MANAGER_PASSWORD。")
     st.caption(f"脚本目录：{', '.join(str(path) for path in CONFIG.paths('script_roots'))}")
@@ -2441,7 +2448,7 @@ PAGES = {
 }
 
 with st.sidebar:
-    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.12")
+    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.13")
     page = st.radio("导航", list(PAGES), label_visibility="collapsed")
     st.divider(); health = SLURM.health(); st.metric("Slurm CLI", f"{sum(bool(x['available']) for x in health)}/{len(health)}")
     st.caption(f"用户：{CONFIG.get('default_user', '')}")

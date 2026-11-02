@@ -24,7 +24,7 @@
 - 每个计算节点任务可挂载多个日志和结果跟踪项，命令重定向日志可自动识别和预填；另支持多个独立日志追踪。日志窗口固定高度并可滚动。
 - 从模板创建 vLLM 作业，可在预设中覆盖模型路径与名称；从脚本推断端口、从 `/v1/models` 识别模型名，生成并检查 endpoint，并提供 Slurm 日志及就地取消作业。
 - vLLM 和 XX保活均支持可维护的一键提交预设；vLLM 启动后自动轮询新作业，XX保活的活跃作业可直接 Tail 日志。
-- SQLite 操作审计和基础环境诊断。
+- SQLite 数据库在开发机本地临时目录读写，每分钟备份到项目目录的持久快照；操作审计和基础环境诊断。
 
 ## 安装和启动
 
@@ -35,12 +35,12 @@ cd /path/to/slurm_manager
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-cp config.example.json config.json
+cp config.example.yaml config.yaml
 export SLURM_MANAGER_PASSWORD='请设置一个强密码'
 bash run_slurm_manager.sh
 ```
 
-如果未设置 `SLURM_MANAGER_PASSWORD`，默认登录密码为 `fghjfghj`。环境变量的优先级高于 `config.json` 中的 `default_password`，正式部署时建议始终使用环境变量覆盖默认值。登录后浏览器保存带签名且限时的登录凭证，默认 6 小时内刷新页面无需重新输入密码；密码变更后旧凭证立即失效。
+如果未设置 `SLURM_MANAGER_PASSWORD`，默认登录密码为 `fghjfghj`。环境变量的优先级高于配置文件中的 `default_password`，正式部署时建议始终使用环境变量覆盖默认值。登录后浏览器保存带签名且限时的登录凭证，默认 6 小时内刷新页面无需重新输入密码；密码变更后旧凭证立即失效。
 
 进程名固定为 `aihpc-slurm-manager`，PID 保存在 `.slurm_manager/streamlit.pid`。停止脚本会先发送 `SIGTERM`，5 秒后仍未退出则自动停止其子进程并发送 `SIGKILL`；僵尸进程会被视为已停止并清理 PID 文件。查看和停止服务：
 
@@ -65,7 +65,7 @@ ssh -L 8501:127.0.0.1:8501 user@development-host
 
 ## 配置
 
-复制 `config.example.json` 为 `config.json` 后重点检查：
+复制 `config.example.yaml` 为 `config.yaml` 后重点检查。已有 `config.json` 会先加载，`config.yaml` 中的同名设置再覆盖它；也可通过 `SLURM_MANAGER_CONFIG` 指向单独的 JSON/YAML 配置文件：
 
 - `script_roots`：允许提交的 Slurm 脚本目录。
 - `restart_script_roots`：允许“再次启动”命令引用的外部 Slurm 脚本目录。
@@ -75,6 +75,10 @@ ssh -L 8501:127.0.0.1:8501 user@development-host
 - `default_partitions`：常用 partition。
 - `auth_session_hours`：浏览器登录保持时间，默认 6 小时。
 - `node_connect_command`：快捷作业列表中复制的计算节点连接命令前缀，例如 `python /path/to/connect.py`。
+- `local_state_root`：本地 SQLite 数据目录的父目录，默认 `/tmp`；程序会创建带用户 ID 和项目标识的专属子目录。
+- `state_db`：持久快照文件，默认 `${PROJECT_ROOT}/.slurm_manager/state.db`，适合放在 NFS。
+
+启动时，程序会将已有的本地数据库目录重命名为带日期时间后缀的备份目录，再从 `state_db` 恢复到本地；运行期间每 60 秒通过 SQLite 一致性备份更新持久快照，写入完成后原子替换。正常退出时还会尝试备份一次。异常退出时，最近一次备份之后的变更可能尚未进入持久快照，但上一次本地目录仍会保留供人工恢复。`/tmp` 可能被系统清理，因此不要把它当成唯一持久副本。当前活跃库和快照路径可在“历史与诊断”查看。
 
 `${PROJECT_ROOT}`、`${USER}` 和其他环境变量会自动展开。vLLM token 不写进配置文件；如接口需要认证，设置：
 

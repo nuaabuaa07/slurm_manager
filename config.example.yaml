@@ -1,0 +1,3 @@
+# 默认情况下 config.yaml 覆盖 config.json 的同名设置；其他设置继续沿用 config.json。
+state_db: ${PROJECT_ROOT}/.slurm_manager/state.db  # 持久快照，建议放在 NFS
+local_state_root: /tmp  # 活跃 SQLite 库存放在此目录下自动创建的专属子目录

@@ -1,11 +1,15 @@
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from slurm_manager.catalog import parse_script
 from slurm_manager.auth import auth_cookie_name, make_auth_token, valid_auth_token
+from slurm_manager.config import load_config
 from slurm_manager.files import preview_jsonl, resolve_allowed
+from slurm_manager.local_state import LocalStateMirror, get_local_state_mirror
 from slurm_manager.metrics import _cpu_totals, _dcgm_gpu_rows
 from slurm_manager.ray import ShellGateway, extract_log_path, normalize_background_command, shell_port
 from slurm_manager.runner import CommandResult
@@ -95,6 +99,93 @@ class FileTests(unittest.TestCase):
 
 
 class UtilityTests(unittest.TestCase):
+    def test_local_sqlite_snapshot_restore_and_stale_directory_rotation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "nfs" / "state.db"
+            local_root = root / "local"
+            initial = StateStore(snapshot)
+            initial.save_preset("metrics", "saved", {"nodes": "n1"})
+
+            first = LocalStateMirror(snapshot, local_root, "test-project", interval_seconds=3600)
+            self.assertNotEqual(first.store.path, snapshot)
+            self.assertEqual(first.store.presets("metrics")[0]["name"], "saved")
+            first.store.save_preset("metrics", "new", {"nodes": "n2"})
+            self.assertEqual(len(StateStore(snapshot).presets("metrics")), 1)
+            first.backup()
+            self.assertEqual(len(StateStore(snapshot).presets("metrics")), 2)
+            first.close()
+
+            # A leftover local DB is preserved and the persistent snapshot wins.
+            StateStore(first.local_path).save_preset("metrics", "stale", {"nodes": "n3"})
+            second = LocalStateMirror(snapshot, local_root, "test-project", interval_seconds=3600)
+            self.assertEqual({p["name"] for p in second.store.presets("metrics")}, {"saved", "new"})
+            archived = list(local_root.glob(first.local_dir.name + ".*"))
+            self.assertEqual(len(archived), 1)
+            self.assertIn("stale", {p["name"] for p in StateStore(archived[0] / "state.db").presets("metrics")})
+            second.close()
+
+    def test_yaml_config_for_local_sqlite_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text("local_state_root: /tmp/slurm-manager-test\nstate_db: /tmp/snapshot.db\n")
+            config = load_config(str(config_path))
+            self.assertEqual(config.get("local_state_root"), "/tmp/slurm-manager-test")
+            self.assertEqual(config.get("state_db"), "/tmp/snapshot.db")
+
+    def test_yaml_overrides_existing_json_without_losing_other_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text('{"default_user":"existing-user","local_state_root":"/old"}')
+            (root / "config.yaml").write_text("local_state_root: /new\n")
+            with patch("slurm_manager.config.PROJECT_ROOT", root), patch.dict(
+                "os.environ", {"SLURM_MANAGER_CONFIG": ""}
+            ):
+                config = load_config()
+            self.assertEqual(config.get("default_user"), "existing-user")
+            self.assertEqual(config.get("local_state_root"), "/new")
+
+    def test_local_sqlite_snapshot_runs_on_interval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "nfs" / "state.db"
+            mirror = LocalStateMirror(snapshot, root / "local", "interval-project", interval_seconds=0.05)
+            try:
+                mirror.store.save_preset("metrics", "scheduled", {"nodes": "n1"})
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if StateStore(snapshot).presets("metrics"):
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(StateStore(snapshot).presets("metrics")[0]["name"], "scheduled")
+            finally:
+                mirror.close()
+
+    def test_local_sqlite_mirror_reused_within_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = get_local_state_mirror(root / "nfs" / "state.db", root / "local", "same-project")
+            try:
+                second = get_local_state_mirror(root / "nfs" / "state.db", root / "local", "same-project")
+                self.assertIs(first, second)
+            finally:
+                first.close()
+
+    def test_failed_snapshot_replacement_keeps_previous_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "nfs" / "state.db"
+            mirror = LocalStateMirror(snapshot, root / "local", "failure-project", interval_seconds=3600)
+            try:
+                mirror.store.save_preset("metrics", "new", {"nodes": "n1"})
+                with patch("slurm_manager.local_state.os.replace", side_effect=OSError("write failed")):
+                    with self.assertRaises(OSError):
+                        mirror.backup()
+                self.assertEqual(StateStore(snapshot).presets("metrics"), [])
+                self.assertEqual(list(snapshot.parent.glob(".state.db.*.tmp")), [])
+            finally:
+                mirror.close()
+
     def test_quick_job_schema_migrates_existing_database(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "old.db"
