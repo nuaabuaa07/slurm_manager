@@ -9,6 +9,8 @@ import shlex
 import shutil
 import tempfile
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -76,6 +78,11 @@ def services():
 
 
 CONFIG, RUNNER, SLURM, METRICS, STORE, GATEWAY, STATE_MIRROR = services()
+
+
+@st.cache_resource
+def background_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="slurm-manager-background")
 
 
 def auth_query_token() -> str:
@@ -1244,6 +1251,7 @@ def show_submission_command_editor(record: Mapping[str, Any]) -> None:
             submission_command_editor(record)
 
 
+@st.fragment
 def render_quick_job_manager() -> None:
     title_col, refresh_col, delete_col = st.columns([5, 1, 1.7])
     title_col.subheader("快捷作业列表")
@@ -1425,21 +1433,51 @@ def metric_quick_actions(selected_nodes: Sequence[str], partition: str) -> None:
             st.session_state["vllm_recent_job"] = job_id
 
 
+def collect_metrics_in_background(
+    partition: str, nodes: List[str], method: str, timeout: int,
+) -> List[Dict[str, Any]]:
+    return METRICS.collect(partition, nodes, SLURM.node_addresses(), method, timeout)
+
+
 def run_metric_payload(payload: Mapping[str, Any]) -> None:
     nodes = split_values(str(payload.get("nodes", "")))
     if not nodes:
         st.error("采样组没有节点。")
         return
-    addresses = SLURM.node_addresses()
-    with st.spinner(f"正在采样 {len(nodes)} 个节点……"):
-        data = METRICS.collect(
-            str(payload.get("partition", "")), nodes, addresses,
+    if st.session_state.get("metrics_pending"):
+        st.warning("上一组节点仍在采样，请等待完成后再发起新采样。")
+        return
+    st.session_state["metrics_pending"] = {
+        "future": background_executor().submit(
+            collect_metrics_in_background,
+            str(payload.get("partition", "")), nodes,
             str(payload.get("method", "auto")), int(payload.get("timeout", 20)),
-        )
-    st.session_state["node_metrics"] = data
-    st.session_state["node_metrics_name"] = str(payload.get("name", "手工采样"))
-    st.session_state["node_metrics_partition"] = str(payload.get("partition", ""))
-    st.session_state["node_metrics_version"] = int(st.session_state.get("node_metrics_version", 0)) + 1
+        ),
+        "name": str(payload.get("name", "手工采样")),
+        "partition": str(payload.get("partition", "")),
+        "count": len(nodes),
+    }
+    st.session_state.pop("metrics_error", None)
+
+
+@st.fragment(run_every="2s")
+def poll_metric_sampling() -> None:
+    pending = st.session_state.get("metrics_pending")
+    if not pending:
+        return
+    future = pending["future"]
+    if not future.done():
+        st.info(f"正在后台采样 {pending['count']} 个节点；可继续编辑页面其他配置。")
+        return
+    st.session_state.pop("metrics_pending", None)
+    try:
+        st.session_state["node_metrics"] = future.result()
+        st.session_state["node_metrics_name"] = pending["name"]
+        st.session_state["node_metrics_partition"] = pending["partition"]
+        st.session_state["node_metrics_version"] = int(st.session_state.get("node_metrics_version", 0)) + 1
+    except Exception as exc:
+        st.session_state["metrics_error"] = str(exc)
+    st.rerun()
 
 
 def metric_presets_editor(default_partition: str, eligible: Sequence[str]) -> None:
@@ -1507,6 +1545,10 @@ def page_cluster() -> None:
         method = st.radio("方式", ["auto", "direct", "srun"], format_func=lambda value: {"auto": "自动", "direct": "仅 exporter", "srun": "仅 srun"}[value], horizontal=True)
         if st.button("采样实时 CPU / 内存 / GPU", disabled=not selected):
             run_metric_payload({"partition": partition, "nodes": ",".join(selected), "method": method, "timeout": 20})
+    if st.session_state.get("metrics_pending"):
+        poll_metric_sampling()
+    if st.session_state.get("metrics_error"):
+        st.error("节点采样失败：" + str(st.session_state["metrics_error"]))
     if st.session_state.get("node_metrics"):
         st.subheader("采样结果 · " + st.session_state.get("node_metrics_name", ""))
         metric_partition = str(st.session_state.get("node_metrics_partition", partition))
@@ -1782,6 +1824,7 @@ def render_managed_job_row(
                 st.rerun()
 
 
+@st.fragment
 def render_job_management() -> None:
     title_column, refresh_column, delete_column = st.columns([5, 1, 1.7])
     title_column.subheader("作业管理")
@@ -1880,6 +1923,8 @@ def select_slurm_job_cards(jobs: Sequence[Mapping[str, str]], key: str, allow_ca
             disabled=selected, use_container_width=True,
         ):
             st.session_state[state_key] = job_id
+            if key == "vllm_endpoint":
+                st.rerun(scope="app")
             st.rerun()
         if allow_cancel:
             token = f"cancel_select_{key}_{job_id}"
@@ -2167,6 +2212,26 @@ def render_compute_task_row(task: Mapping[str, Any]) -> None:
             st.rerun()
 
 
+@st.fragment
+def render_compute_task_manager() -> None:
+    st.divider()
+    task_title, refresh_column, delete_column = st.columns([5, 1.4, 1.7])
+    task_title.subheader("已管理的计算节点任务")
+    tasks = STORE.compute_tasks()
+    if refresh_column.button("刷新全部 PID 状态", disabled=not tasks):
+        refresh_compute_tasks(tasks); st.rerun()
+    stopped_tasks = stopped_compute_tasks(tasks)
+    bulk_delete_stopped_control(
+        "bulk_delete_compute_tasks",
+        len(stopped_tasks),
+        delete_stopped_compute_task_records,
+        delete_column,
+    )
+    for task in tasks:
+        render_compute_task_row(task)
+    independent_log_tracking()
+
+
 def page_compute_tasks() -> None:
     st.title("计算节点任务")
     users = users_value("compute_users")
@@ -2213,39 +2278,11 @@ def page_compute_tasks() -> None:
                 if submit_compute_payload(payload, selected_job, node, address, port):
                     st.rerun()
 
-    st.divider()
-    task_title, refresh_column, delete_column = st.columns([5, 1.4, 1.7])
-    task_title.subheader("已管理的计算节点任务")
-    tasks = STORE.compute_tasks()
-    if refresh_column.button("刷新全部 PID 状态", disabled=not tasks):
-        refresh_compute_tasks(tasks); st.rerun()
-    stopped_tasks = stopped_compute_tasks(tasks)
-    bulk_delete_stopped_control(
-        "bulk_delete_compute_tasks",
-        len(stopped_tasks),
-        delete_stopped_compute_task_records,
-        delete_column,
-    )
-    for task in tasks:
-        render_compute_task_row(task)
-    independent_log_tracking()
+    render_compute_task_manager()
 
 
-def page_vllm() -> None:
-    st.title("vLLM 节点")
-    scripts = script_catalog("vllm")
-    st.subheader("一键启动预设")
-    def start_vllm(payload: Mapping[str, Any]) -> None:
-        job_id = submit_payload(payload, "VLLM_START")
-        if job_id:
-            st.session_state["vllm_wait_job"] = job_id
-            st.session_state["vllm_recent_job"] = job_id
-
-    preset_cards("vllm", "启动", start_vllm)
-    slurm_preset_editor("vllm", scripts, "新增或修改 vLLM 预设")
-    with st.expander("自定义提交 vLLM 脚本"):
-        custom_submit_form(scripts, "vllm_custom")
-    st.divider()
+@st.fragment
+def render_vllm_job_section() -> Optional[str]:
     endpoint_title, delete_column = st.columns([6, 1.7])
     endpoint_title.subheader("Endpoint")
     vllm_users = str(CONFIG.get("default_user", ""))
@@ -2265,7 +2302,7 @@ def page_vllm() -> None:
     if waiting_job_id and waiting_job and waiting_job["state"] == "RUNNING":
         st.session_state["selected_job_vllm_endpoint"] = waiting_job_id
         st.session_state.pop("vllm_wait_job", None)
-        st.rerun()
+        st.rerun(scope="app")
     if waiting_job_id:
         state = waiting_job["state"] if waiting_job else "等待进入队列"
         st.info(f"正在等待新作业 {waiting_job_id} 就绪（{state}），Endpoint 区域会自动刷新。")
@@ -2278,7 +2315,79 @@ def page_vllm() -> None:
         if job["state"] == "RUNNING"
         and ("vllm" in job["name"].lower() or job["job_id"] in {waiting_job_id, recent_job_id})
     ]
-    selected_job = select_slurm_job_cards(jobs, "vllm_endpoint", allow_cancel=True)
+    return select_slurm_job_cards(jobs, "vllm_endpoint", allow_cancel=True)
+
+
+@st.fragment(run_every="2s")
+def poll_vllm_model_detection(signature: str, model_key: str) -> None:
+    pending = st.session_state.get("vllm_model_detection_pending")
+    if not pending:
+        return
+    if pending["signature"] != signature or pending["model_key"] != model_key:
+        pending["future"].cancel()
+        st.session_state.pop("vllm_model_detection_pending", None)
+        return
+    future = pending["future"]
+    if not future.done():
+        mode = "逐个检查" if pending["all_endpoints"] else "抽样识别"
+        st.info(f"正在后台{mode}模型（{pending['count']} 个 Endpoint）；其他输入仍可编辑。")
+        return
+    st.session_state.pop("vllm_model_detection_pending", None)
+    try:
+        detections = future.result()
+    except Exception as exc:
+        st.session_state["vllm_model_detection_error"] = str(exc)
+        st.session_state["vllm_model_detection_signature"] = signature
+    else:
+        st.session_state["vllm_model_detection_error"] = ""
+        st.session_state["vllm_model_detections"] = detections
+        st.session_state["vllm_model_detection_signature"] = signature
+        names = {str(name) for item in detections if item.get("ok") for name in item.get("models", []) if name}
+        if len(names) == 1 and st.session_state.get(model_key) == pending["original_model"]:
+            st.session_state["vllm_model_pending_value"] = (signature, model_key, next(iter(names)))
+    st.rerun()
+
+
+@st.fragment(run_every="2s")
+def poll_vllm_endpoint_check(signature: str) -> None:
+    pending = st.session_state.get("vllm_endpoint_check_pending")
+    if not pending:
+        return
+    if pending["signature"] != signature:
+        pending["future"].cancel()
+        st.session_state.pop("vllm_endpoint_check_pending", None)
+        return
+    future = pending["future"]
+    if not future.done():
+        st.info(f"正在后台检查 {pending['count']} 个 Endpoint；其他输入仍可编辑。")
+        return
+    st.session_state.pop("vllm_endpoint_check_pending", None)
+    try:
+        st.session_state["endpoint_checks"] = future.result()
+        st.session_state["endpoint_checks_signature"] = signature
+        st.session_state["vllm_endpoint_check_error"] = ""
+    except Exception as exc:
+        st.session_state["vllm_endpoint_check_error"] = str(exc)
+        st.session_state["vllm_endpoint_check_error_signature"] = signature
+    st.rerun()
+
+
+def page_vllm() -> None:
+    st.title("vLLM 节点")
+    scripts = script_catalog("vllm")
+    st.subheader("一键启动预设")
+    def start_vllm(payload: Mapping[str, Any]) -> None:
+        job_id = submit_payload(payload, "VLLM_START")
+        if job_id:
+            st.session_state["vllm_wait_job"] = job_id
+            st.session_state["vllm_recent_job"] = job_id
+
+    preset_cards("vllm", "启动", start_vllm)
+    slurm_preset_editor("vllm", scripts, "新增或修改 vLLM 预设")
+    with st.expander("自定义提交 vLLM 脚本"):
+        custom_submit_form(scripts, "vllm_custom")
+    st.divider()
+    selected_job = render_vllm_job_section()
     addresses: List[str] = []
     inferred: Dict[str, str] = {}
     inferred_script = ""
@@ -2309,27 +2418,78 @@ def page_vllm() -> None:
     model_key = "vllm_model_" + endpoint_key
     if model_key not in st.session_state:
         st.session_state[model_key] = inferred.get("model") or str(CONFIG.get("vllm_default_model", ""))
-    if st.button("从 Endpoint API 识别模型名", disabled=not endpoints, key="detect_vllm_model_" + endpoint_key):
+    model_detection_signature = json.dumps(endpoints, ensure_ascii=False)
+    pending_model_value = st.session_state.pop("vllm_model_pending_value", None)
+    if pending_model_value and pending_model_value[:2] == (model_detection_signature, model_key):
+        st.session_state[model_key] = pending_model_value[2]
+    if st.session_state.get("vllm_model_detection_signature") != model_detection_signature:
+        st.session_state.pop("vllm_model_detections", None)
+        st.session_state.pop("vllm_model_detection_error", None)
+    detection_pending = st.session_state.get("vllm_model_detection_pending")
+    quick_col, all_col = st.columns(2)
+    quick_clicked = quick_col.button(
+        "快速识别模型名（抽样）", disabled=not endpoints or bool(detection_pending),
+        key="detect_vllm_model_" + endpoint_key,
+    )
+    all_clicked = all_col.button(
+        "检查全部模型名（较慢）", disabled=not endpoints or bool(detection_pending),
+        key="detect_all_vllm_models_" + endpoint_key,
+    )
+    if quick_clicked or all_clicked:
         token = os.environ.get(str(CONFIG.get("vllm_api_token_env", "VLLM_API_TOKEN")), "")
-        detections = detect_models(endpoints, token)
-        st.session_state["vllm_model_detections"] = detections
-        detected = next((str(name) for item in detections if item.get("ok") for name in item.get("models", []) if name), "")
-        if detected:
-            st.session_state[model_key] = detected
-            st.rerun()
+        probe_limit = 0 if all_clicked else 12
+        st.session_state["vllm_model_detection_pending"] = {
+            "signature": model_detection_signature,
+            "model_key": model_key,
+            "original_model": st.session_state[model_key],
+            "count": len(endpoints) if all_clicked else min(12, len(endpoints)),
+            "all_endpoints": all_clicked,
+            "future": background_executor().submit(detect_models, list(endpoints), token, 3, probe_limit),
+        }
+        st.session_state.pop("vllm_model_detections", None)
+        st.session_state["vllm_model_detection_error"] = ""
+        detection_pending = st.session_state["vllm_model_detection_pending"]
+    if detection_pending:
+        poll_vllm_model_detection(model_detection_signature, model_key)
     model = st.text_input("模型名（可自动识别，也可人工修改）", key=model_key)
-    if st.session_state.get("vllm_model_detections"):
+    if st.session_state.get("vllm_model_detection_error"):
+        st.error("模型识别失败：" + str(st.session_state["vllm_model_detection_error"]))
+    detections = st.session_state.get("vllm_model_detections", [])
+    if st.session_state.get("vllm_model_detection_signature") == model_detection_signature and detections:
+        names = Counter(
+            str(name) for item in detections if item.get("ok") for name in item.get("models", []) if name
+        )
+        successful = sum(bool(item.get("ok")) for item in detections)
+        st.caption(f"模型识别：成功 {successful}/{len(detections)} 个已检查 Endpoint；总 Endpoint {len(endpoints)} 个。")
+        if not names:
+            st.error("已检查的 Endpoint 均未返回模型名；当前输入框仍是原值，尚未通过 API 确认。请查看识别结果中的错误原因。")
+        elif len(names) > 1:
+            st.warning("识别到多个模型：" + "；".join(f"{name}（{count} 个）" for name, count in names.items()) + "。请人工核对并填写模型名。")
+        elif successful < len(detections):
+            st.warning(f"部分 Endpoint 识别失败（{len(detections) - successful} 个）；成功节点返回的模型名为 {next(iter(names))}。")
         with st.expander("模型识别结果", expanded=False):
-            st.dataframe(st.session_state["vllm_model_detections"], use_container_width=True, hide_index=True)
+            st.dataframe(detections, use_container_width=True, hide_index=True)
     style = st.radio("导出格式", ["python", "json", "lines"], horizontal=True)
     st.code(format_endpoints(endpoints, style), language="python" if style == "python" else "text")
     endpoint_check_signature = json.dumps(
         {"endpoints": endpoints, "model": model}, ensure_ascii=False, sort_keys=True
     )
-    if st.button("并发检查 Endpoint", disabled=not endpoints):
+    if st.session_state.get("vllm_endpoint_check_error_signature") != endpoint_check_signature:
+        st.session_state.pop("vllm_endpoint_check_error", None)
+    check_pending = st.session_state.get("vllm_endpoint_check_pending")
+    if st.button("并发检查 Endpoint", disabled=not endpoints or bool(check_pending)):
         token = os.environ.get(str(CONFIG.get("vllm_api_token_env", "VLLM_API_TOKEN")), "")
-        st.session_state["endpoint_checks"] = check_endpoints(endpoints, model, token)
-        st.session_state["endpoint_checks_signature"] = endpoint_check_signature
+        st.session_state["vllm_endpoint_check_pending"] = {
+            "signature": endpoint_check_signature,
+            "count": len(endpoints),
+            "future": background_executor().submit(check_endpoints, list(endpoints), model, token),
+        }
+        st.session_state["vllm_endpoint_check_error"] = ""
+        check_pending = st.session_state["vllm_endpoint_check_pending"]
+    if check_pending:
+        poll_vllm_endpoint_check(endpoint_check_signature)
+    if st.session_state.get("vllm_endpoint_check_error"):
+        st.error("Endpoint 检查失败：" + str(st.session_state["vllm_endpoint_check_error"]))
     checks = (
         st.session_state.get("endpoint_checks", [])
         if st.session_state.get("endpoint_checks_signature") == endpoint_check_signature
@@ -2404,12 +2564,8 @@ def page_vllm() -> None:
                 st.error(str(exc))
 
 
-def page_keepalive() -> None:
-    st.title("XX保活")
-    scripts = script_catalog("keepalive")
-    st.subheader("一键启动预设")
-    preset_cards("keepalive", "启动", lambda payload: submit_payload(payload, "KEEPALIVE_START"))
-    slurm_preset_editor("keepalive", scripts, "新增或修改预设")
+@st.fragment
+def render_keepalive_jobs() -> None:
     st.divider(); st.subheader("活跃作业")
     jobs = active_jobs(str(CONFIG.get("default_user", "")))
     keep_jobs = [job for job in jobs if any(token in job["name"].lower() for token in ("keep", "stress"))]
@@ -2418,6 +2574,15 @@ def page_keepalive() -> None:
     for index, job in enumerate(keep_jobs):
         with columns[index % len(columns)]:
             job_card(job, "keepalive", show_details=False, show_logs=True)
+
+
+def page_keepalive() -> None:
+    st.title("XX保活")
+    scripts = script_catalog("keepalive")
+    st.subheader("一键启动预设")
+    preset_cards("keepalive", "启动", lambda payload: submit_payload(payload, "KEEPALIVE_START"))
+    slurm_preset_editor("keepalive", scripts, "新增或修改预设")
+    render_keepalive_jobs()
 
 
 def page_history() -> None:
@@ -2448,7 +2613,7 @@ PAGES = {
 }
 
 with st.sidebar:
-    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.13")
+    st.title("AIHPC"); st.caption("Slurm Manager · 0.7.14")
     page = st.radio("导航", list(PAGES), label_visibility="collapsed")
     st.divider(); health = SLURM.health(); st.metric("Slurm CLI", f"{sum(bool(x['available']) for x in health)}/{len(health)}")
     st.caption(f"用户：{CONFIG.get('default_user', '')}")

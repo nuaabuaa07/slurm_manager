@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -41,6 +43,11 @@ class SubmitRequest:
 class SlurmService:
     def __init__(self, runner: CommandRunner):
         self.runner = runner
+        self._cache_lock = threading.Lock()
+        self._address_cache: Dict[str, str] = {}
+        self._address_cache_until = 0.0
+        self._job_detail_cache: Dict[str, tuple[float, Dict[str, str], CommandResult]] = {}
+        self._job_nodes_cache: Dict[str, tuple[float, List[Dict[str, str]], CommandResult]] = {}
 
     def health(self) -> List[Dict[str, object]]:
         return [
@@ -75,6 +82,9 @@ class SlurmService:
         return rows, result
 
     def node_addresses(self) -> Dict[str, str]:
+        with self._cache_lock:
+            if time.monotonic() < self._address_cache_until:
+                return dict(self._address_cache)
         result = self.runner.run(["scontrol", "show", "nodes", "-o"])
         addresses: Dict[str, str] = {}
         if not result.ok:
@@ -84,6 +94,9 @@ class SlurmService:
             name = values.get("NodeName", "")
             if name:
                 addresses[name] = values.get("NodeAddr", "") or name
+        with self._cache_lock:
+            self._address_cache = addresses
+            self._address_cache_until = time.monotonic() + 30
         return addresses
 
     def jobs(self, user: str = "", include_all: bool = False) -> Tuple[List[Dict[str, str]], CommandResult]:
@@ -96,8 +109,16 @@ class SlurmService:
 
     def job_detail(self, job_id: str) -> Tuple[Dict[str, str], CommandResult]:
         self._validate_job_id(job_id)
+        with self._cache_lock:
+            cached = self._job_detail_cache.get(job_id)
+            if cached and time.monotonic() < cached[0]:
+                return dict(cached[1]), cached[2]
         result = self.runner.run(["scontrol", "show", "job", "-o", job_id])
-        return _key_values(result.stdout), result
+        detail = _key_values(result.stdout)
+        if result.ok and detail:
+            with self._cache_lock:
+                self._job_detail_cache[job_id] = (time.monotonic() + 10, detail, result)
+        return dict(detail), result
 
     def job_history(self, user: str, start: str = "today") -> Tuple[List[Dict[str, str]], CommandResult]:
         columns = ["job_id", "name", "partition", "state", "elapsed", "start", "end", "exit_code"]
@@ -118,6 +139,12 @@ class SlurmService:
         return _key_values(result.stdout).get("NodeAddr", ""), result
 
     def job_nodes(self, job_id: str, limit: int = 0) -> Tuple[List[Dict[str, str]], CommandResult]:
+        self._validate_job_id(job_id)
+        with self._cache_lock:
+            cached = self._job_nodes_cache.get(job_id)
+            if cached and time.monotonic() < cached[0] and (not limit or len(cached[1]) >= limit):
+                nodes = cached[1][:limit] if limit else cached[1]
+                return [dict(item) for item in nodes], cached[2]
         detail, detail_result = self.job_detail(job_id)
         expression = ""
         for key in ("NodeList", "ReqNodeList", "BatchHost"):
@@ -128,13 +155,15 @@ class SlurmService:
         if not expression:
             return [], detail_result
         nodes, expand_result = self.expand_nodelist(expression)
-        if limit > 0:
-            nodes = nodes[:limit]
-        output = []
+        address_map = self.node_addresses()
+        output: List[Dict[str, str]] = []
         for node in nodes:
-            address, _ = self.node_address(node)
-            output.append({"node": node, "address": address or node})
-        return output, expand_result
+            output.append({"node": node, "address": address_map.get(node, node)})
+        if expand_result.ok and output:
+            with self._cache_lock:
+                self._job_nodes_cache[job_id] = (time.monotonic() + 10, output, expand_result)
+        selected = output[:limit] if limit else output
+        return [dict(item) for item in selected], expand_result
 
     def submit_args(self, request: SubmitRequest) -> Tuple[List[str], Path]:
         script = request.script.resolve(strict=True)

@@ -24,6 +24,8 @@ from slurm_manager.vllm import (
     update_python_endpoint_block,
     find_yaml_endpoint_blocks,
     infer_vllm_settings,
+    model_probe_endpoints,
+    detect_models,
     preview_yaml_endpoint_update,
     select_healthy_endpoints,
 )
@@ -45,6 +47,35 @@ class FakeRunner:
 
 
 class SlurmTests(unittest.TestCase):
+    def test_job_nodes_uses_one_address_query_and_short_cache(self):
+        class NodeRunner(FakeRunner):
+            def run(self, args, **kwargs):
+                self.calls.append(list(args))
+                if args[:4] == ["scontrol", "show", "job", "-o"]:
+                    output = "JobId=42 NodeList=node[01-03] BatchHost=node01\n"
+                elif args[:3] == ["scontrol", "show", "hostnames"]:
+                    output = "node01\nnode02\nnode03\n"
+                elif args[:3] == ["scontrol", "show", "nodes"]:
+                    output = "".join(
+                        f"NodeName=node0{i} NodeAddr=10.0.0.{i}\n" for i in range(1, 4)
+                    )
+                else:
+                    self.fail_unexpected(args)
+                return CommandResult(args, 0, output, "", 0.01)
+
+            def fail_unexpected(self, args):
+                raise AssertionError(f"unexpected command: {args}")
+
+        runner = NodeRunner()
+        service = SlurmService(runner)
+        first, result = service.job_nodes("42")
+        self.assertTrue(result.ok)
+        self.assertEqual([item["address"] for item in first], ["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+        self.assertEqual(len(runner.calls), 3)
+        second, _ = service.job_nodes("42", limit=1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(len(runner.calls), 3)
+
     def test_parse_nodes(self):
         runner = FakeRunner("node01|idle|2/14/0/16|524288|gpu:8|none|gpu\n")
         rows, result = SlurmService(runner).nodes("gpu")
@@ -243,6 +274,19 @@ class UtilityTests(unittest.TestCase):
         ]
         self.assertEqual(select_healthy_endpoints(endpoints, checks), [endpoints[0]])
         self.assertEqual(select_healthy_endpoints(endpoints, checks, False), endpoints)
+
+    def test_model_detection_samples_large_endpoint_list(self):
+        endpoints = build_endpoints([f"10.0.0.{index}" for index in range(1, 51)], range(8000, 8008))
+        selected = model_probe_endpoints(endpoints, max_probes=12)
+        self.assertEqual(len(selected), 12)
+        self.assertEqual(selected[:4], endpoints[:4])
+        self.assertIn(endpoints[-1], selected)
+        with patch("slurm_manager.vllm._models_one", side_effect=lambda url, *_: {
+            "url": url, "ok": True, "models": ["model-a"], "error": "",
+        }) as probe:
+            detected = detect_models(endpoints)
+        self.assertEqual(len(detected), 12)
+        self.assertEqual(probe.call_count, 12)
 
     def test_safe_endpoint_update_creates_backup(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -149,12 +149,31 @@ def select_healthy_endpoints(
     return [endpoint for endpoint in endpoints if status.get(endpoint, False)]
 
 
-def detect_models(endpoints: Sequence[str], token: str = "", timeout: int = 8) -> List[Dict[str, object]]:
+def model_probe_endpoints(endpoints: Sequence[str], max_probes: int = 12) -> List[str]:
+    """Probe several ports and spread the remaining probes across the job."""
+    unique = list(dict.fromkeys(endpoints))
+    if max_probes <= 0 or len(unique) <= max_probes:
+        return unique
+    head_count = min(4, max_probes)
+    picked = list(unique[:head_count])
+    remaining = max_probes - head_count
+    tail = unique[head_count:]
+    if remaining == 1:
+        picked.append(tail[-1])
+    elif remaining > 1:
+        picked.extend(tail[index * (len(tail) - 1) // (remaining - 1)] for index in range(remaining))
+    return list(dict.fromkeys(picked))
+
+
+def detect_models(
+    endpoints: Sequence[str], token: str = "", timeout: int = 3,
+    max_probes: int = 12,
+) -> List[Dict[str, object]]:
     model_urls = []
-    for endpoint in endpoints:
+    for endpoint in model_probe_endpoints(endpoints, max_probes):
         base = re.sub(r"/v1/(?:chat/completions|completions)/?$", "", endpoint.rstrip("/"))
         model_urls.append(base + "/v1/models")
-    with ThreadPoolExecutor(max_workers=min(16, max(1, len(model_urls)))) as pool:
+    with ThreadPoolExecutor(max_workers=min(12, max(1, len(model_urls)))) as pool:
         futures = {pool.submit(_models_one, url, token, timeout): url for url in dict.fromkeys(model_urls)}
         return sorted((future.result() for future in as_completed(futures)), key=lambda item: str(item["url"]))
 
