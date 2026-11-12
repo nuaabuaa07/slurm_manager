@@ -48,6 +48,7 @@ class SlurmService:
         self._address_cache_until = 0.0
         self._job_detail_cache: Dict[str, tuple[float, Dict[str, str], CommandResult]] = {}
         self._job_nodes_cache: Dict[str, tuple[float, List[Dict[str, str]], CommandResult]] = {}
+        self._gpu_allocation_cache: Dict[str, tuple[float, Dict[str, int], CommandResult]] = {}
 
     def health(self) -> List[Dict[str, object]]:
         return [
@@ -80,6 +81,38 @@ class SlurmService:
             row["memory_gb"] = round(int(str(row["memory_mb"])) / 1024, 1) if str(row["memory_mb"]).isdigit() else 0
             row["address"] = address_map.get(str(row["node"]), str(row["node"]))
         return rows, result
+
+    def gpu_allocations(self, partition: str) -> Tuple[Dict[str, int], CommandResult]:
+        """GPU GRES allocations per node; missing data must not imply idle GPUs."""
+        with self._cache_lock:
+            cached = self._gpu_allocation_cache.get(partition)
+            if cached and time.monotonic() < cached[0]:
+                return dict(cached[1]), cached[2]
+        result = self.runner.run([
+            "sinfo", "-N", "-h", "-p", partition,
+            "-O", "NodeList:100,GresUsed:300",
+        ])
+        allocations: Dict[str, int] = {}
+        if not result.ok:
+            return allocations, result
+        for line in result.stdout.splitlines():
+            fields = line.split(None, 1)
+            if len(fields) != 2:
+                continue
+            node, used = fields[0], fields[1].strip()
+            if used in {"(null)", "N/A", ""}:
+                allocations[node] = 0
+                continue
+            counts = [
+                int(match.group(1))
+                for item in used.split(",")
+                if (match := re.match(r"gpu(?::[^:,()]+)*:(\d+)(?:\(|$)", item.strip()))
+            ]
+            if counts:
+                allocations[node] = sum(counts)
+        with self._cache_lock:
+            self._gpu_allocation_cache[partition] = (time.monotonic() + 10, allocations, result)
+        return allocations, result
 
     def node_addresses(self) -> Dict[str, str]:
         with self._cache_lock:

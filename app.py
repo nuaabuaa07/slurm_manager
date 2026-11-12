@@ -738,13 +738,18 @@ def partition_node_picker(
     count_auto_default: bool = True,
     show_select_all: bool = False,
     include_unavailable: bool = False,
+    show_free_resources: bool = False,
+    allowed_nodes: Optional[Sequence[str]] = None,
 ) -> tuple[List[str], List[Dict[str, Any]], int, bool]:
     rows, result = SLURM.nodes(partition)
+    if allowed_nodes is not None:
+        allowed = set(allowed_nodes)
+        rows = [row for row in rows if str(row["node"]) in allowed]
     all_nodes = [str(row["node"]) for row in rows]
     available = [str(row["node"]) for row in rows if not str(row["state"]).startswith(("down", "drain"))]
     idle = [str(row["node"]) for row in rows if str(row["state"]).startswith("idle")]
     selectable = all_nodes if include_unavailable else available
-    options = list(dict.fromkeys(selectable + list(defaults)))
+    options = list(dict.fromkeys(selectable + [item for item in defaults if allowed_nodes is None or item in allowed]))
     widget_key = f"{key}_nodes_{partition}"
     count_key = f"{key}_count_{partition}"
     auto_key = f"{key}_count_auto_{partition}"
@@ -759,7 +764,24 @@ def partition_node_picker(
         if st.session_state.get(auto_key, True):
             st.session_state[count_key] = max(1, len(st.session_state.get(widget_key, [])))
 
-    button_columns = st.columns([1, 1, 5]) if show_select_all else st.columns([1, 5])
+    gpu_free: List[str] = []
+    cpu_free: List[str] = []
+    if show_free_resources and result.ok:
+        gpu_allocations, gpu_result = SLURM.gpu_allocations(partition)
+        gpu_free = [
+            str(row["node"]) for row in rows
+            if str(row["node"]) in selectable
+            and re.search(r"(?:^|,)gpu(?::[^:,()]+)*:[1-9]\d*", str(row["gres"]))
+            and gpu_result.ok and gpu_allocations.get(str(row["node"])) == 0
+        ]
+        cpu_free = [
+            str(row["node"]) for row in rows
+            if str(row["node"]) in selectable
+            and len(parts := str(row["cpu"]).split("/")) == 4
+            and parts[1].isdigit() and parts[3].isdigit()
+            and int(parts[3]) > 0 and 2 * int(parts[1]) > int(parts[3])
+        ]
+    button_columns = st.columns([1, 1, 1, 1, 4] if show_select_all and show_free_resources else [1, 1, 1, 4] if show_free_resources else [1, 1, 5] if show_select_all else [1, 5])
     c1 = button_columns[0]
     if c1.button("全选 Idle", key=f"{key}_all_idle_{partition}", disabled=not idle):
         st.session_state[widget_key] = idle
@@ -771,6 +793,18 @@ def partition_node_picker(
             st.session_state[widget_key] = options
             if st.session_state.get(auto_key, True):
                 st.session_state[count_key] = max(1, len(options))
+    if show_free_resources:
+        first = 2 if show_select_all else 1
+        for column, label, candidates, explanation, suffix in (
+            (button_columns[first], "全选 GPU 空闲", gpu_free,
+             "仅选择该 Partition 中配置了 GPU、Slurm 当前没有分配任何 GPU 的可用节点；不是实时 GPU 利用率。", "gpu_free"),
+            (button_columns[first + 1], "全选 CPU 空闲", cpu_free,
+             "仅选择该 Partition 中 Slurm 空闲 CPU 数量严格超过总数 50% 的可用节点；不是实时 CPU 利用率。", "cpu_free"),
+        ):
+            if column.button(label, key=f"{key}_{suffix}_{partition}", disabled=not candidates, help=explanation):
+                st.session_state[widget_key] = candidates
+                if st.session_state.get(auto_key, True):
+                    st.session_state[count_key] = max(1, len(candidates))
     caption_column.caption(f"{partition}：{len(rows)} 个节点，{len(idle)} 个 idle；可全选后取消个别节点。")
     selected = st.multiselect("节点", options, key=widget_key, on_change=sync_node_count)
     if not result.ok:
@@ -822,6 +856,7 @@ def slurm_preset_editor(kind: str, scripts: Sequence[ScriptInfo], title: str = "
             default_count,
             True,
             bool(payload.get("nodes_auto", True)),
+            show_free_resources=kind == "vllm",
         ) if partition else ([], [], 1, True)
         model_path = ""
         model_name = ""
@@ -2056,22 +2091,31 @@ def submit_compute_payload(
         return None
 
 
-def compute_preset_cards(selected_job: str, node: str, address: str, port: int) -> None:
+def compute_preset_cards(selected_job: str, node: str, address: str, port: int, node_addresses: Mapping[str, str]) -> None:
     presets = STORE.presets("compute")
     if not presets:
         st.caption("暂无计算节点任务预设，可在下方创建。")
         return
     for preset in presets:
         payload = preset["payload"]
+        saved_nodes = split_values(str(payload.get("target_nodes", "")))
+        target_nodes = saved_nodes or ([node] if node else [])
+        targets_available = bool(target_nodes) and all(item in node_addresses for item in target_nodes)
         detail_col, run_col, edit_col, delete_col = st.columns([7, 1.15, 1, 1])
         with detail_col.expander(preset_summary(preset, "compute"), expanded=False):
             preset_details("compute", payload)
         if run_col.button(
             "一键提交", type="primary", key=f"run_compute_preset_{preset['id']}",
-            disabled=not (selected_job and node), use_container_width=True,
+            disabled=not (selected_job and targets_available), use_container_width=True,
         ):
-            if submit_compute_payload(payload, selected_job, node, address, port):
+            submitted = [
+                submit_compute_payload(payload, selected_job, target, node_addresses[target], port)
+                for target in target_nodes
+            ]
+            if any(submitted):
                 st.rerun()
+        if saved_nodes and not targets_available:
+            st.caption("预设目标节点不属于当前 Slurm Job，请修改预设或选择对应 Job。")
         if edit_col.button("修改", key=f"edit_compute_preset_{preset['id']}", use_container_width=True):
             st.session_state["compute_preset_choice"] = str(preset["name"])
             st.rerun()
@@ -2091,7 +2135,7 @@ def compute_preset_cards(selected_job: str, node: str, address: str, port: int) 
                 st.rerun()
 
 
-def compute_preset_editor() -> None:
+def compute_preset_editor(selected_job: str, partition: str, node_addresses: Mapping[str, str]) -> None:
     presets = STORE.presets("compute")
     with st.expander("新增或修改任务预设", expanded=False):
         choices = ["＋ 新增预设"] + [str(item["name"]) for item in presets]
@@ -2108,10 +2152,23 @@ def compute_preset_editor() -> None:
             key="compute_preset_type_" + suffix,
         )
         command = st.text_area("完整命令", value=str(payload.get("command", "")), height=220, key="compute_preset_command_" + suffix)
+        target_nodes: List[str] = []
+        if selected_job and partition and node_addresses:
+            st.caption("目标节点限于当前 Slurm Job 已分配的节点。多选时，一键提交会在每个选中节点各启动一次任务。")
+            target_nodes, _, _, _ = partition_node_picker(
+                partition, f"compute_preset_{suffix}_{selected_job}",
+                split_values(str(payload.get("target_nodes", ""))) or list(node_addresses)[:1],
+                show_select_all=True,
+                show_free_resources=True,
+                allowed_nodes=list(node_addresses),
+            )
+        else:
+            st.caption("先在上方选择运行中的 Slurm Job，才能为预设指定目标节点。")
         if st.button("更新预设" if editing else "新增预设", type="primary", disabled=not (preset_name and task_name and command), key="save_compute_preset_" + suffix):
             STORE.save_preset(
                 "compute", preset_name,
-                {"task_name": task_name, "task_type": task_type, "command": command},
+                {"task_name": task_name, "task_type": task_type, "command": command,
+                 "target_nodes": ",".join(target_nodes) if selected_job else str(payload.get("target_nodes", ""))},
                 int(editing["id"]) if editing else None,
             )
             st.rerun()
@@ -2242,6 +2299,7 @@ def page_compute_tasks() -> None:
     node = ""
     address = ""
     port = 0
+    node_labels: Dict[str, str] = {}
     if selected:
         nodes, _ = SLURM.job_nodes(selected_job)
         node_labels = {item["node"]: item["address"] for item in nodes}
@@ -2260,8 +2318,8 @@ def page_compute_tasks() -> None:
         st.caption("Ray 任务和一般任务都通过 Slurm Job 提供的计算节点连接通道提交；停止时终止任务父进程组及其全部子进程。")
 
     st.subheader("2. 一键提交预设")
-    compute_preset_cards(selected_job or "", node, address, port)
-    compute_preset_editor()
+    compute_preset_cards(selected_job or "", node, address, port, node_labels)
+    compute_preset_editor(selected_job or "", str(selected["partition"]) if selected else "", node_labels)
 
     with st.expander("3. 自定义提交任务", expanded=False):
         if not (selected and node):

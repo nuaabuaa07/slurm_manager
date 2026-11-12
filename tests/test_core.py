@@ -47,6 +47,19 @@ class FakeRunner:
 
 
 class SlurmTests(unittest.TestCase):
+    def test_gpu_allocations_are_per_node_and_cached(self):
+        runner = FakeRunner(
+            "node01   gpu:0(IDX:N/A)\n"
+            "node02   gpu:4(IDX:0-3)\n"
+            "node03   gpu:mi300:2(IDX:0-1),gpu:h100:1(IDX:2)\n"
+        )
+        service = SlurmService(runner)
+        allocations, result = service.gpu_allocations("gpu")
+        self.assertTrue(result.ok)
+        self.assertEqual(allocations, {"node01": 0, "node02": 4, "node03": 3})
+        self.assertEqual(service.gpu_allocations("gpu")[0], allocations)
+        self.assertEqual(len(runner.calls), 1)
+
     def test_job_nodes_uses_one_address_query_and_short_cache(self):
         class NodeRunner(FakeRunner):
             def run(self, args, **kwargs):
