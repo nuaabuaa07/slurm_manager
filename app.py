@@ -28,6 +28,7 @@ from slurm_manager.config import PROJECT_ROOT, load_config
 from slurm_manager.files import find_jsonl, list_directory, preview_jsonl, resolve_allowed
 from slurm_manager.metrics import MetricsService
 from slurm_manager.local_state import get_local_state_mirror
+from slurm_manager.probe_keepalive import ProbeKeepalive
 from slurm_manager.ray import ShellGateway, extract_log_path, shell_port
 from slurm_manager.runner import CommandResult, CommandRunner
 from slurm_manager.slurm import SlurmService, SubmitRequest, expand_slurm_log_pattern, tail_text
@@ -78,6 +79,11 @@ def services():
 
 
 CONFIG, RUNNER, SLURM, METRICS, STORE, GATEWAY, STATE_MIRROR = services()
+
+
+@st.cache_resource
+def probe_keepalive_service() -> ProbeKeepalive:
+    return ProbeKeepalive(STORE, SLURM, METRICS)
 
 
 @st.cache_resource
@@ -2641,6 +2647,120 @@ def page_keepalive() -> None:
     preset_cards("keepalive", "启动", lambda payload: submit_payload(payload, "KEEPALIVE_START"))
     slurm_preset_editor("keepalive", scripts, "新增或修改预设")
     render_keepalive_jobs()
+    render_probe_keepalive()
+
+
+@st.fragment(run_every="5s")
+def probe_keepalive_status() -> None:
+    probe = probe_keepalive_service()
+    state = probe.snapshot()
+    phase = str(state.get("phase", "idle"))
+    st.caption("后台探针状态每 5 秒更新；页面关闭后后台线程仍继续执行，服务重启后从数据库恢复。")
+    steps = [
+        ("1 · GPU 空闲采样", "scanning", {"probing", "ready", "stressing"}),
+        ("2 · 接口与模型探测", "probing", {"ready", "stressing"}),
+        ("3 · 压力调用", "stressing", set()),
+    ]
+    order = {"scanning": 0, "probing": 1, "stressing": 2}
+    for label, active, done in steps:
+        marker = ("🔄 执行中" if phase == active else "✅ 已完成" if phase in done
+                  else "❌ 失败" if phase == "error" and state.get("failed_phase") == active
+                  else "✅ 已完成" if phase == "error" and order.get(active, 9) < order.get(str(state.get("failed_phase")), -1)
+                  else "⚪ 等待")
+        st.write(f"{label}：{marker}")
+    if state.get("error"):
+        st.error(str(state["error"]))
+    if not state:
+        return
+    st.caption(f"阶段：{phase} · 最近更新：{state.get('updated_at', '-')} · GPU 阈值：≤{state.get('threshold', 0)}% · 目标利用率：{state.get('target_util', 0)}%")
+    candidates = []
+    now = time.time()
+    for node in state.get("nodes", []):
+        sample = state.get("samples", {}).get(node, {})
+        since = state.get("since", {}).get(node)
+        candidates.append({"节点": node, "GPU 数": sample.get("gpu_count"),
+                           "GPU 最大利用率 %": sample.get("max_util_pct"),
+                           "连续达标分钟": round((now - since) / 60, 1) if since else 0,
+                           "状态": "候选" if since else "未达标/无数据", "错误": sample.get("error", "")})
+    if candidates:
+        st.dataframe(candidates, use_container_width=True, hide_index=True)
+    if phase in {"scanning", "stopped", "error"} and state.get("nodes"):
+        options = ([item["节点"] for item in candidates if item["状态"] == "候选"]
+                   if phase == "scanning" else list(state["nodes"]))
+        manual = st.multiselect("手动固化候选节点", options, key="probe_manual_nodes")
+        c1, c2 = st.columns(2)
+        if c1.button("停止探测并使用所选节点", disabled=not manual, key="probe_select_nodes"):
+            try:
+                probe.select_nodes(manual)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        if phase == "scanning" and c2.button("停止探针", key="probe_stop_scan"):
+            probe.stop()
+            st.rerun()
+    if state.get("selected_nodes"):
+        st.write("保活节点：" + "、".join(state["selected_nodes"]))
+    if phase == "probing" and st.button("停止接口探测", key="probe_stop_discovery"):
+        probe.stop()
+        st.rerun()
+    if phase in {"ready", "stopped", "error", "stressing"}:
+        endpoints = state.get("endpoints", [])
+        if endpoints:
+            st.dataframe(endpoints, use_container_width=True, hide_index=True)
+        with st.expander("手动填写或修改接口", expanded=False):
+            rows = st.data_editor(
+                [{"url": item.get("url", ""), "address": item.get("address", ""),
+                  "model": item.get("model", ""), "enabled": item.get("enabled", True)} for item in endpoints]
+                or [{"url": "", "address": "", "model": "", "enabled": True}],
+                num_rows="dynamic", key="probe_endpoint_editor", use_container_width=True,
+            )
+            if st.button("保存接口", key="probe_save_endpoints"):
+                try:
+                    probe.set_endpoints([item for item in rows if str(item.get("url", "")).strip()])
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        if phase == "ready" and st.button("启动压力调用", disabled=not endpoints, key="probe_start_pressure"):
+            try:
+                probe.start_pressure()
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        if phase == "stressing":
+            st.caption(f"请求：{state.get('requests', 0)} · 失败：{state.get('errors', 0)} · 当前 GPU 最大利用率：{state.get('observed_gpu_util_pct', '-')}%")
+            if st.button("停止压力调用", key="probe_stop_pressure"):
+                probe.stop()
+                st.rerun()
+
+
+def render_probe_keepalive() -> None:
+    st.divider()
+    st.subheader("探针 vLLM 保活")
+    probe = probe_keepalive_service()
+    state = probe.snapshot()
+    st.markdown("**第 1 步 · 配置扫描范围**")
+    partitions = partition_options(str(state.get("partition", "")))
+    if not partitions:
+        st.warning("没有可选 Partition。")
+        return
+    partition = st.selectbox("Partition", partitions, key="probe_partition")
+    nodes, _, _, _ = partition_node_picker(
+        partition, "probe_keepalive", state.get("nodes", []), show_select_all=True,
+    )
+    c1, c2, c3 = st.columns(3)
+    threshold = c1.number_input("候选节点 GPU 最大利用率阈值 %", 0.0, 100.0, 0.0, 1.0, key="probe_threshold")
+    duration = c2.number_input("连续达标时间（分钟）", 1, 1440, 60, key="probe_duration")
+    target_util = c3.number_input("压力目标 GPU 利用率 %", 0.0, 100.0, 50.0, 1.0, key="probe_target_util")
+    ports = st.text_input("接口端口或区间", value="8000-8007,8600-8604", key="probe_ports")
+    st.markdown("**第 2 步 · 启动串行流程**")
+    st.caption("每 60 秒采样一次；节点 GPU 最大利用率连续低于或等于阈值满指定时间后，自动探测接口与模型，再向所有达标节点的可用接口发送压力请求。")
+    if st.button("一键串行执行全部步骤", type="primary", disabled=not nodes, key="probe_start_all"):
+        try:
+            probe.start(partition, nodes, float(threshold), ports, float(target_util), int(duration) * 60)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    probe_keepalive_status()
 
 
 def page_history() -> None:
